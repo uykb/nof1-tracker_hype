@@ -6,51 +6,7 @@
 
 实时监控 Hyperliquid 链上指定地址的合约交易，自动同步到 Binance 期货账户执行。**链上信号源 → CEX 执行**的跟单架构。
 
----
-
-## 重构说明
-
-本项目从 `nof1-tracker` v1.0.3 重构为 `hl-cex-tracker` v2.0.0，核心变化是将信号源从 **NOF1 AI Agent 平台** 替换为 **Hyperliquid 链上地址监控**，实现"链上信号源 → CEX 执行"的全新跟单模式。
-
-### 为什么要重构？
-
-原项目通过轮询 `nof1.ai/api` 获取 AI Agent 的持仓快照来跟单。这种方式有本质局限：
-
-1. **中心化依赖**：信号源依赖第三方 API，API 变更或宕机直接失效
-2. **延迟不可控**：轮询间隔固定，无法捕捉瞬间的仓位变化
-3. **策略受限**：只能跟 AI Agent 的开/平/换仓信号，无法追踪真实链上交易者
-4. **循环依赖**：原代码存在 3 处循环依赖（`api-client ↔ analyze-api`、`futures-capital-manager ↔ analyze-api`、`types/api ↔ services`），架构不健康
-
-重构后直接监控 Hyperliquid 链上地址，数据来源是链上真实交易，任何人都可以成为信号源。
-
-### 架构对比
-
-#### 旧架构 (v1.0.3)
-
-```
-NOF1 API (REST 轮询)
-    │
-    ▼
-ApiClient.getAgentData()     ← 获取 AI Agent 持仓
-    │
-    ▼
-ApiAnalyzer.followAgent()    ← 编排中心（也是类型导出中心，循环依赖）
-    │
-    ├──→ FollowService        ← 核心逻辑（依赖 ApiAnalyzer 的类型导出）
-    ├──→ PositionManager       ← 仓位管理（同样通过 analyze-api 间接引用类型）
-    ├──→ RiskManager           ← 风险评估
-    ├──→ FuturesCapitalManager ← 保证金分配（循环依赖）
-    ├──→ TradingExecutor       ← 交易执行
-    ├──→ OrderHistoryManager   ← 历史记录
-    └──→ ApiClient             ← API 客户端（循环依赖）
-    │
-    ▼
-BinanceService → Binance API
-```
-
-**问题**：`analyze-api.ts` 同时承担类型导出和服务编排两个职责，导致 `api-client.ts`、`futures-capital-manager.ts` 与之形成循环依赖。`types/api.ts` 反向依赖 `services/risk-manager.ts` 和 `services/futures-capital-manager.ts`，违反了类型文件应该是叶子节点的原则。
-
-#### 新架构 (v2.0.0)
+## 架构
 
 ```
 Hyperliquid 链上地址
@@ -74,89 +30,6 @@ Hyperliquid 链上地址
         │
   BinanceService              ← Binance 期货 API
 ```
-
-**改进**：
-
-1. **零循环依赖**：`types/index.ts` 是纯叶子模块，不依赖任何 service
-2. **事件驱动**：WebSocket 填充事件即时触发轮询，不再仅依赖定时器
-3. **单一职责**：每个 service 只做一件事，编排逻辑集中在 `MirrorEngine`
-
-### 模块映射
-
-| 旧模块 (v1) | 新模块 (v2) | 变化说明 |
-|---|---|---|
-| `services/api-client.ts` | `services/hyperliquid-client.ts` | NOF1 API → Hyperliquid REST API |
-| — | `services/hyperliquid-ws.ts` | **新增**：HL WebSocket 连接（自动重连+心跳） |
-| `services/binance-service.ts` | `services/binance-service.ts` | **保留**：适配新接口，核心逻辑不变 |
-| `scripts/analyze-api.ts` | `services/mirror-engine.ts` | 编排中心重写，移除类型导出职责 |
-| `services/follow-service.ts` | `services/position-tracker.ts` + `services/risk-manager.ts` | 拆分：位置追踪独立，信号构建独立 |
-| `services/position-manager.ts` | `services/trade-executor.ts` | 重写：简化为开仓/平仓/止盈止损/孤儿单清理 |
-| `services/futures-capital-manager.ts` | `services/capital-manager.ts` | 简化：移除多 Agent 分配逻辑，支持单地址 |
-| `services/order-history-manager.ts` | `services/order-history.ts` | 简化：增加链上 fill 时间去重 |
-| `services/profit-calculator.ts` | — | **移除**：原项目盈亏统计功能暂不包含 |
-| `services/trade-history-service.ts` | — | **移除**：Binance 交易历史查询暂不包含 |
-| `services/config-manager.ts` | `config/constants.ts` | 合并到配置常量 |
-| `services/trading-executor.ts` | `services/trade-executor.ts` | 重写：整合原 position-manager 和 trading-executor |
-| `types/api.ts` + 循环依赖 | `types/index.ts` | **关键改进**：纯类型叶子模块，零循环依赖 |
-| `commands/follow.ts` | `index.ts` (follow 命令) | 简化：移除 agent 选择，改为地址参数 |
-| `commands/agents.ts` | — | **移除**：不再有 AI Agent 列表 |
-| `commands/profit.ts` | — | **移除**：盈亏分析暂不包含 |
-| `commands/status.ts` | `index.ts` (status 命令) | 简化：检查 HL + Binance 连接 |
-
-### 信号检测对比
-
-| 旧信号 (v1) | 新信号 (v2) | 说明 |
-|---|---|---|
-| 孤儿订单清理 | 孤儿订单清理 | **保留**：每轮轮询前清理 |
-| entry_oid 变更 | SIDE_FLIPPED | **改进**：直接检测多翻空/空翻多，不再依赖 OID |
-| 新开仓 | NEW | **保留**：检测新 symbol 出现 |
-| 平仓 | CLOSED | **保留**：检测仓位归零 |
-| — | INCREASED | **新增**：检测加仓（size 增大但方向不变） |
-| — | DECREASED | **新增**：检测减仓（size 减小但方向不变） |
-| 止盈退出 | — | **移除**：不再基于 AI Agent 的 exit_plan 自动止盈 |
-| TP/SL 自动下单 | 止盈止损（可选） | **改进**：使用链上持仓的 liquidationPrice 作为 SL 参考值 |
-| — | LEVERAGE_CHANGED | **新增**：检测杠杆/保证金模式变更 |
-
-### 数据流对比
-
-#### 旧流程
-
-```
-每 30s 定时 → NOF1 API 获取 Agent 持仓
-    → 重建上次状态（从 order-history.json）
-    → 比对 entry_oid 变化
-    → 生成 FollowPlan
-    → 风险评估
-    → 执行交易
-```
-
-#### 新流程
-
-```
-WebSocket userFills 事件 ──→ 立即触发轮询
-每 3s 定时 ──→ HL REST 获取 clearinghouseState
-    → 解析为 MirrorPosition[]
-    → 与上次快照比对 → PositionDelta[]
-    → RiskManager 构建信号 → TradeSignal
-    → 价格容差检查
-    → 保证金分配
-    → 市价执行
-    → 记录 OrderHistory
-```
-
-### 关键技术改进
-
-| 方面 | 旧方案 | 新方案 |
-|---|---|---|
-| **信号获取** | REST 轮询 (30s 间隔) | WebSocket 实时推送 + REST 轮询 (3s 间隔) |
-| **状态管理** | 从 JSON 重建上次状态 | 内存 Map + JSON 持久化 |
-| **去重机制** | entry_oid + symbol | symbol + side + hlFillTime |
-| **类型系统** | types/api.ts 循环依赖 services | types/index.ts 纯叶子模块 |
-| **依赖数量** | 9 个 runtime 依赖（含 winston 未使用） | 6 个 runtime 依赖（精简） |
-| **编排架构** | ApiAnalyzer 双重职责 | MirrorEngine 单一编排 |
-| **Symbol 映射** | 硬编码 BTC→BTCUSDT | SYMBOL_MAP 字典（40+ 币种） |
-
----
 
 ## 快速开始
 
@@ -424,19 +297,6 @@ npm run build     # 编译 TypeScript
 npm run lint      # 代码检查
 npm run format    # 代码格式化
 ```
-
-## 从 v1 迁移
-
-如果你从 `nof1-tracker` v1 升级，注意以下破坏性变更：
-
-1. **环境变量**：移除 `NOF1_API_BASE_URL`，新增 `HYPERLIQUID_TARGET_ADDRESS`、`HYPERLIQUID_TESTNET`、`HYPERLIQUID_POLL_INTERVAL_MS`、`TOTAL_MARGIN_USDT`、`MARGIN_TYPE`、`PRICE_TOLERANCE_PERCENT`
-2. **命令变更**：
-   - `follow <agent>` → `follow [--address <addr>]`（不再跟 Agent，改为跟链上地址）
-   - 移除 `agents` 命令
-   - 移除 `profit` 命令
-   - 新增 `positions <address>` 命令
-3. **数据目录**：`data/order-history.json` 格式不兼容，需要清空重新开始
-4. **依赖变更**：移除 `winston`、`querystring`，新增 `ws`
 
 ## 许可证
 
