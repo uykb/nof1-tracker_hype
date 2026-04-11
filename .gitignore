@@ -32,9 +32,15 @@ logs/
 # Coverage reports
 coverage/
 
+# Test files
+jest.config.js
+src/__tests__/
+*.test.ts
+*.spec.ts
+
 # Temporary files
 tmp/
 temp/
 .claude/
-data
+data/
 .jest-cache
