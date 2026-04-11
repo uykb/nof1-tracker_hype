@@ -1,453 +1,443 @@
-# Nof1 AI Agent 跟单交易系统
-
-中文 | [English](./README_EN.md)
+# HL-CEX Tracker - Hyperliquid 链上跟单系统
 
 ![TypeScript](https://img.shields.io/badge/typescript-5.0%2B-blue)
 ![Node.js](https://img.shields.io/badge/node-%3E%3D18.0.0-green)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-一个用于跟踪 nof1.ai AI Agent 交易信号并自动执行 Binance 合约交易的命令行工具。支持7个AI量化Agent的实时跟单，自动识别开仓、平仓、换仓和止盈止损信号。
+实时监控 Hyperliquid 链上指定地址的合约交易，自动同步到 Binance 期货账户执行。**链上信号源 → CEX 执行**的跟单架构。
 
-## ⚡ 快速开始
+---
+
+## 重构说明
+
+本项目从 `nof1-tracker` v1.0.3 重构为 `hl-cex-tracker` v2.0.0，核心变化是将信号源从 **NOF1 AI Agent 平台** 替换为 **Hyperliquid 链上地址监控**，实现"链上信号源 → CEX 执行"的全新跟单模式。
+
+### 为什么要重构？
+
+原项目通过轮询 `nof1.ai/api` 获取 AI Agent 的持仓快照来跟单。这种方式有本质局限：
+
+1. **中心化依赖**：信号源依赖第三方 API，API 变更或宕机直接失效
+2. **延迟不可控**：轮询间隔固定，无法捕捉瞬间的仓位变化
+3. **策略受限**：只能跟 AI Agent 的开/平/换仓信号，无法追踪真实链上交易者
+4. **循环依赖**：原代码存在 3 处循环依赖（`api-client ↔ analyze-api`、`futures-capital-manager ↔ analyze-api`、`types/api ↔ services`），架构不健康
+
+重构后直接监控 Hyperliquid 链上地址，数据来源是链上真实交易，任何人都可以成为信号源。
+
+### 架构对比
+
+#### 旧架构 (v1.0.3)
+
+```
+NOF1 API (REST 轮询)
+    │
+    ▼
+ApiClient.getAgentData()     ← 获取 AI Agent 持仓
+    │
+    ▼
+ApiAnalyzer.followAgent()    ← 编排中心（也是类型导出中心，循环依赖）
+    │
+    ├──→ FollowService        ← 核心逻辑（依赖 ApiAnalyzer 的类型导出）
+    ├──→ PositionManager       ← 仓位管理（同样通过 analyze-api 间接引用类型）
+    ├──→ RiskManager           ← 风险评估
+    ├──→ FuturesCapitalManager ← 保证金分配（循环依赖）
+    ├──→ TradingExecutor       ← 交易执行
+    ├──→ OrderHistoryManager   ← 历史记录
+    └──→ ApiClient             ← API 客户端（循环依赖）
+    │
+    ▼
+BinanceService → Binance API
+```
+
+**问题**：`analyze-api.ts` 同时承担类型导出和服务编排两个职责，导致 `api-client.ts`、`futures-capital-manager.ts` 与之形成循环依赖。`types/api.ts` 反向依赖 `services/risk-manager.ts` 和 `services/futures-capital-manager.ts`，违反了类型文件应该是叶子节点的原则。
+
+#### 新架构 (v2.0.0)
+
+```
+Hyperliquid 链上地址
+        │
+   ┌────┴────┐
+   │ WS 推送  │  ← userFills 实时事件（填充即触发轮询）
+   │ REST 轮询 │  ← clearinghouseState 定时快照（3s 间隔）
+   └────┬────┘
+        │
+  PositionTracker             ← 仓位状态追踪 & 6 种 Delta 检测
+        │
+  RiskManager                 ← 价格容差 + 信号构建
+        │
+  CapitalManager              ← 保证金分配
+        │
+  TradeExecutor               ← Binance 市价执行 + 止盈止损 + 孤儿单清理
+        │
+  OrderHistoryManager         ← JSON 持久化 + 去重
+        │
+  MirrorEngine (编排)         ← 统一调度，事件驱动
+        │
+  BinanceService              ← Binance 期货 API
+```
+
+**改进**：
+
+1. **零循环依赖**：`types/index.ts` 是纯叶子模块，不依赖任何 service
+2. **事件驱动**：WebSocket 填充事件即时触发轮询，不再仅依赖定时器
+3. **单一职责**：每个 service 只做一件事，编排逻辑集中在 `MirrorEngine`
+
+### 模块映射
+
+| 旧模块 (v1) | 新模块 (v2) | 变化说明 |
+|---|---|---|
+| `services/api-client.ts` | `services/hyperliquid-client.ts` | NOF1 API → Hyperliquid REST API |
+| — | `services/hyperliquid-ws.ts` | **新增**：HL WebSocket 连接（自动重连+心跳） |
+| `services/binance-service.ts` | `services/binance-service.ts` | **保留**：适配新接口，核心逻辑不变 |
+| `scripts/analyze-api.ts` | `services/mirror-engine.ts` | 编排中心重写，移除类型导出职责 |
+| `services/follow-service.ts` | `services/position-tracker.ts` + `services/risk-manager.ts` | 拆分：位置追踪独立，信号构建独立 |
+| `services/position-manager.ts` | `services/trade-executor.ts` | 重写：简化为开仓/平仓/止盈止损/孤儿单清理 |
+| `services/futures-capital-manager.ts` | `services/capital-manager.ts` | 简化：移除多 Agent 分配逻辑，支持单地址 |
+| `services/order-history-manager.ts` | `services/order-history.ts` | 简化：增加链上 fill 时间去重 |
+| `services/profit-calculator.ts` | — | **移除**：原项目盈亏统计功能暂不包含 |
+| `services/trade-history-service.ts` | — | **移除**：Binance 交易历史查询暂不包含 |
+| `services/config-manager.ts` | `config/constants.ts` | 合并到配置常量 |
+| `services/trading-executor.ts` | `services/trade-executor.ts` | 重写：整合原 position-manager 和 trading-executor |
+| `types/api.ts` + 循环依赖 | `types/index.ts` | **关键改进**：纯类型叶子模块，零循环依赖 |
+| `commands/follow.ts` | `index.ts` (follow 命令) | 简化：移除 agent 选择，改为地址参数 |
+| `commands/agents.ts` | — | **移除**：不再有 AI Agent 列表 |
+| `commands/profit.ts` | — | **移除**：盈亏分析暂不包含 |
+| `commands/status.ts` | `index.ts` (status 命令) | 简化：检查 HL + Binance 连接 |
+
+### 信号检测对比
+
+| 旧信号 (v1) | 新信号 (v2) | 说明 |
+|---|---|---|
+| 孤儿订单清理 | 孤儿订单清理 | **保留**：每轮轮询前清理 |
+| entry_oid 变更 | SIDE_FLIPPED | **改进**：直接检测多翻空/空翻多，不再依赖 OID |
+| 新开仓 | NEW | **保留**：检测新 symbol 出现 |
+| 平仓 | CLOSED | **保留**：检测仓位归零 |
+| — | INCREASED | **新增**：检测加仓（size 增大但方向不变） |
+| — | DECREASED | **新增**：检测减仓（size 减小但方向不变） |
+| 止盈退出 | — | **移除**：不再基于 AI Agent 的 exit_plan 自动止盈 |
+| TP/SL 自动下单 | 止盈止损（可选） | **改进**：使用链上持仓的 liquidationPrice 作为 SL 参考值 |
+| — | LEVERAGE_CHANGED | **新增**：检测杠杆/保证金模式变更 |
+
+### 数据流对比
+
+#### 旧流程
+
+```
+每 30s 定时 → NOF1 API 获取 Agent 持仓
+    → 重建上次状态（从 order-history.json）
+    → 比对 entry_oid 变化
+    → 生成 FollowPlan
+    → 风险评估
+    → 执行交易
+```
+
+#### 新流程
+
+```
+WebSocket userFills 事件 ──→ 立即触发轮询
+每 3s 定时 ──→ HL REST 获取 clearinghouseState
+    → 解析为 MirrorPosition[]
+    → 与上次快照比对 → PositionDelta[]
+    → RiskManager 构建信号 → TradeSignal
+    → 价格容差检查
+    → 保证金分配
+    → 市价执行
+    → 记录 OrderHistory
+```
+
+### 关键技术改进
+
+| 方面 | 旧方案 | 新方案 |
+|---|---|---|
+| **信号获取** | REST 轮询 (30s 间隔) | WebSocket 实时推送 + REST 轮询 (3s 间隔) |
+| **状态管理** | 从 JSON 重建上次状态 | 内存 Map + JSON 持久化 |
+| **去重机制** | entry_oid + symbol | symbol + side + hlFillTime |
+| **类型系统** | types/api.ts 循环依赖 services | types/index.ts 纯叶子模块 |
+| **依赖数量** | 9 个 runtime 依赖（含 winston 未使用） | 6 个 runtime 依赖（精简） |
+| **编排架构** | ApiAnalyzer 双重职责 | MirrorEngine 单一编排 |
+| **Symbol 映射** | 硬编码 BTC→BTCUSDT | SYMBOL_MAP 字典（40+ 币种） |
+
+---
+
+## 快速开始
 
 ```bash
-# 1. 安装和构建
+# 1. 安装依赖
 npm install && npm run build
 
 # 2. 配置环境变量
 cp .env.example .env
-# 编辑 .env 文件，填入 Binance API 密钥（必须启用合约交易权限）
+# 编辑 .env，填入：
+#   HYPERLIQUID_TARGET_ADDRESS=0x...  （要跟单的 HL 地址）
+#   BINANCE_API_KEY=...               （币安 API Key）
+#   BINANCE_API_SECRET=...             （币安 API Secret）
 
-# 3. 查看可用的AI Agent
-npm start -- agents
+# 3. 检查连接状态
+npm start -- status
 
-# 4. 开始跟单（风险控制模式，不会真实交易）
-npm start -- follow deepseek-chat-v3.1 --risk-only
+# 4. 查看目标地址持仓
+npm start -- positions 0xYourAddress
 
-# 5. 持续监控跟单（每30秒检查一次）
-npm start -- follow gpt-5 --interval 30
+# 5. 启动跟单（试运行模式，不执行交易）
+npm start -- follow --dry-run
 
-# 6. 查看盈利统计
-npm start -- profit
+# 6. 正式跟单
+npm start -- follow
 ```
 
-## 🚀 功能特性
+## 命令说明
 
-- **🤖 AI Agent跟单**: 支持7个AI量化交易Agent（GPT-5、Gemini、DeepSeek等）
-- **📊 实时监控**: 可配置轮询间隔，持续跟踪Agent交易动作
-- **🔄 智能跟单**: 自动识别开仓、平仓、换仓（OID变化）和止盈止损
-- **🎯 盈利目标退出**: 支持设置自定义盈利目标，达到后自动平仓退出
-- **🔄 自动重新跟单**: 可选的自动重新跟单功能，盈利退出后自动重新入场
-- **⚡ 合约交易**: 完整支持Binance USDT永续合约，支持1x-125x杠杆
-- **📈 盈利统计**: 精确的盈利分析，基于真实交易数据计算（含手续费统计）
-- **🛡️ 风险控制**: 支持`--risk-only`模式，只观察不执行交易
+### `follow` - 启动跟单
 
-## 📊 实盘跟踪
-
-**deepseek-chat-v3.1 Agent 实盘跟踪面板**: [https://nof1-tracker-dashboard.onrender.com](https://nof1-tracker-dashboard.onrender.com)
-
-实时查看 deepseek-chat-v3.1 AI Agent 的交易表现、持仓情况和盈亏统计。
-
-## 🤖 支持的AI Agent
-
-| Agent名称 |
-|----------|
-| **gpt-5** |
-| **gemini-2.5-pro** |
-| **deepseek-chat-v3.1** |
-| **claude-sonnet-4-5** |
-| **buynhold_btc** |
-| **grok-4** |
-| **qwen3-max** |
-
-
-## ⚙️ 配置
-
-### 1. Binance API 密钥配置（重要）
-
-本系统使用 **Binance 合约交易API**，必须正确配置权限：
-
-#### 创建API密钥
-1. 登录 [Binance](https://www.binance.com/) → [API Management](https://www.binance.com/en/my/settings/api-management)
-2. 创建新API密钥，完成安全验证
-
-#### 配置权限（关键）
-- ✅ **Enable Futures** - 启用合约交易（必选）
-- ✅ **Enable Reading** - 启用读取权限（必选）
-- ❌ **Enable Withdrawals** - 不需要提现权限
-
-#### 测试网环境（推荐新手）
-1. 访问 [Binance Testnet](https://testnet.binancefuture.com/)
-2. 创建测试网API密钥
-3. 在`.env`中设置：
-   ```env
-   BINANCE_TESTNET=true
-   BINANCE_API_KEY=测试网API密钥
-   BINANCE_API_SECRET=测试网Secret密钥
-   ```
-
-### 2. 环境变量配置
-
-```env
-# Binance API Configuration - 必须支持合约交易
-BINANCE_API_KEY=your_binance_api_key_here
-BINANCE_API_SECRET=your_binance_api_secret_here
-BINANCE_TESTNET=true  # true=测试网, false=正式网
-
-# Trading Configuration
-MAX_POSITION_SIZE=1000
-DEFAULT_LEVERAGE=10
-RISK_PERCENTAGE=2.0
-```
-
-## 📖 使用方法
-
-### 核心命令
-
-#### 1. 查看可用的AI Agent
 ```bash
-npm start -- agents
-```
+# 基本用法（使用 .env 中的地址）
+npm start -- follow
 
-#### 2. 跟单AI Agent（核心功能）
+# 指定地址（覆盖 .env）
+npm start -- follow -a 0x1234...
 
-**基础用法**：
-```bash
-# 单次执行
-npm start -- follow deepseek-chat-v3.1
+# 设置总保证金
+npm start -- follow -m 500
 
-# 持续监控（每30秒轮询）
-npm start -- follow gpt-5 --interval 30
+# 设置保证金模式
+npm start -- follow --margin-type ISOLATED
 
-# 风险控制模式（只观察不执行）
-npm start -- follow claude-sonnet-4-5 --risk-only
-```
+# 设置价格容差（偏离源地址入场价超过此百分比不执行）
+npm start -- follow -p 2.0
 
-**高级选项**：
-```bash
-# 设置总保证金（默认10 USDT）
-npm start -- follow gpt-5 --total-margin 5000
-
-# 设置价格容差（默认1.0%）
-npm start -- follow deepseek-chat-v3.1 --price-tolerance 1.0
-
-# 盈利目标退出（达到30%盈利时自动平仓）
-npm start -- follow gpt-5 --profit 30
-
-# 盈利目标退出 + 自动重新跟单
-npm start -- follow deepseek-chat-v3.1 --profit 30 --auto-refollow
-
-# 设置保证金模式（逐仓模式）
-npm start -- follow gpt-5 --margin-type ISOLATED
-
-# 设置保证金模式（全仓模式，默认）
-npm start -- follow deepseek-chat-v3.1 --margin-type CROSSED
+# 试运行（不执行真实交易）
+npm start -- follow --dry-run
 
 # 组合使用
-npm start -- follow gpt-5 --interval 30 --total-margin 2000 --profit 25 --auto-refollow --margin-type ISOLATED
+npm start -- follow -a 0x... -m 200 --margin-type CROSSED -p 1.5 --dry-run
 ```
 
-**命令选项说明**：
-- `-r, --risk-only`: 只评估不执行交易（安全模式）
-- `-i, --interval <seconds>`: 轮询间隔（秒），默认30秒
-- `-t, --price-tolerance <percentage>`: 价格容差百分比，默认1.0%
-- `-m, --total-margin <amount>`: 总保证金（USDT），默认10
-- `--profit <percentage>`: 盈利目标百分比，达到后自动平仓退出
-- `--auto-refollow`: 自动重新跟单，盈利退出后自动重新入场（默认关闭）
-- `--margin-type <type>`: 保证金模式，ISOLATED（逐仓）或 CROSSED（全仓，默认）
+**选项**：
 
-#### 3. 盈利统计分析
-```bash
-# 统计跟单开始以来的总盈利（默认包含浮动盈亏）
-npm start -- profit
+| 选项 | 简写 | 说明 | 默认值 |
+|------|------|------|--------|
+| `--address` | `-a` | Hyperliquid 地址 | .env 配置 |
+| `--total-margin` | `-m` | 总保证金 (USDT) | 100 |
+| `--margin-type` | | 保证金模式 | CROSSED |
+| `--price-tolerance` | `-p` | 价格容差 (%) | 1.0 |
+| `--max-position-size` | | 最大仓位数 (USDT) | 1000 |
+| `--dry-run` | | 试运行，不执行交易 | false |
+| `--log-level` | `-l` | 日志级别 | INFO |
 
-# 统计指定时间范围的盈利
-npm start -- profit --since 7d        # 最近7天
-npm start -- profit --since 2024-01-01 # 从2024年1月1日开始
-npm start -- profit --since 1704067200000 # 使用时间戳
+### `status` - 检查连接
 
-# 指定交易对统计
-npm start -- profit --pair BTCUSDT
-
-# JSON格式输出
-npm start -- profit --format json
-
-# 强制刷新缓存数据
-npm start -- profit --refresh
-
-# 包含当前仓位的浮动盈亏（默认行为）
-npm start -- profit
-
-# 仅显示当前仓位的浮动盈亏（不含已实现交易）
-npm start -- profit --unrealized-only
-
-# 排除浮动盈亏（仅分析已实现交易）
-npm start -- profit --exclude-unrealized
-```
-
-**profit命令选项说明**：
-- `-s, --since <time>`: 时间筛选器，支持"7d"（最近7天）、"2024-01-01"（指定日期）、时间戳格式。不指定则使用order-history.json的创建时间
-- `-p, --pair <symbol>`: 指定交易对（如BTCUSDT）
-- `--group-by <type>`: 分组方式：symbol（按交易对）或all（全部）
-- `--format <type>`: 输出格式：table（表格）或json（JSON）
-- `--refresh`: 强制刷新缓存，获取最新数据
-- `--exclude-unrealized`: 排除当前仓位的浮动盈亏，仅分析已实现交易
-- `--unrealized-only`: 仅显示当前仓位的浮动盈亏
-
-**输出统计信息**：
-- **基础统计**: 总交易次数、已实现盈亏（扣除手续费）、胜率、平均盈利/亏损
-- **浮动盈亏**: 当前仓位数量、总浮动盈亏、详细仓位信息（默认包含，使用--exclude-unrealized时排除）
-- **总盈亏**: 已实现盈亏 + 浮动盈亏的完整盈利情况
-- **手续费分析**: 总手续费支出、平均每笔手续费
-- **风险指标**: 最大单笔盈利、最大单笔亏损、浮动盈亏风险提示
-- **分组统计**: 按交易对分组的详细盈利情况
-
-#### 4. 系统状态检查
 ```bash
 npm start -- status
 ```
 
-### 跟单策略说明
+检查 Hyperliquid API 和 Binance API 的连接状态，显示目标地址持仓概要和币安账户余额。
 
-系统自动识别4种交易信号：
-
-1. **📈 新开仓 (ENTER)** - Agent开新仓位时自动跟单
-2. **📉 平仓 (EXIT)** - Agent平仓时自动跟单
-3. **🔄 换仓 (OID变化)** - 检测到entry_oid变化时，先平旧仓再开新仓
-4. **🎯 止盈止损** - 价格达到profit_target或stop_loss时自动平仓
-
-### 🎯 盈利目标退出和自动重新跟单
-
-#### 盈利目标退出
-设置自定义盈利目标，当仓位达到指定盈利百分比时自动平仓退出：
+### `positions <address>` - 查看持仓
 
 ```bash
-# 当盈利达到30%时自动平仓
-npm start -- follow gpt-5 --profit 30
-
-# 当盈利达到50%时自动平仓
-npm start -- follow deepseek-chat-v3.1 --profit 50
+npm start -- positions 0xYourAddress
 ```
 
-**特点**：
-- ✅ 实时监控每个仓位的盈利百分比
-- ✅ 达到目标后立即执行市价平仓
-- ✅ 支持多头和空头仓位的盈利计算
-- ✅ 完整的盈利退出事件记录
+查看指定地址在 Hyperliquid 上的当前持仓，包括方向、数量、入场价、杠杆、未实现盈亏和强平价格。
 
-#### 自动重新跟单
-在盈利退出的基础上，可选择自动重新跟单功能：
+## 跟单策略详解
 
-```bash
-# 盈利30%退出后，自动重新跟单
-npm start -- follow gpt-5 --profit 30 --auto-refollow
+系统检测 6 种仓位变化信号：
 
-# 组合使用：持续监控 + 盈利目标 + 自动重新跟单
-npm start -- follow deepseek-chat-v3.1 --interval 30 --profit 25 --auto-refollow
+| 信号 | 触发条件 | 执行动作 |
+|------|---------|---------|
+| **NEW** | 源地址新开仓 | 同方向市价开仓 |
+| **CLOSED** | 源地址平仓 | 同方向市价平仓 |
+| **INCREASED** | 源地址加仓（size 增大，方向不变） | 同方向加仓 |
+| **DECREASED** | 源地址减仓（size 减小，方向不变） | 同方向减仓 |
+| **SIDE_FLIPPED** | 源地址多翻空/空翻多 | 先平旧仓再开新仓 |
+| **LEVERAGE_CHANGED** | 源地址调杠杆或改保证金模式 | 修改 Binance 杠杆/模式 |
+
+### 风控机制
+
+1. **价格容差检查**：源地址入场价与当前市价偏差超过阈值时跳过（默认 1%）
+2. **最大仓位限制**：单仓名义价值不超过设定上限（默认 1000 USDT）
+3. **孤儿单清理**：每轮轮询前清理无对应持仓的止盈止损单
+4. **保证金检查**：余额不足时自动缩减仓位至 95% 可用余额，仍不足则跳过
+5. **杠杆警告**：杠杆超过 20x 时输出警告日志
+
+### 执行流程
+
+```
+启动
+  │
+  ├── 初始化 Binance 连接
+  ├── 加载历史订单
+  ├── 获取 HL 地址当前持仓快照
+  ├── 连接 HL WebSocket → 订阅 userFills
+  │
+  └── 主循环（3s 间隔 + WS 事件触发）
+        │
+        ├── 清理孤儿订单
+        │
+        ├── REST 获取 clearinghouseState
+        │     │
+        │     ▼
+        │   解析为 MirrorPosition[]
+        │     │
+        │     ▼
+        │   与上次快照比对 → PositionDelta[]
+        │
+        ├── 遍历 Delta 列表：
+        │     │
+        │     ├── RiskManager 构建信号 → TradeSignal
+        │     │
+        │     ├── 价格容差检查（市价 vs 源地址入场价）
+        │     │
+        │     ├── CapitalManager 分配保证金 → 计算数量
+        │     │
+        │     ├── TradeExecutor 执行市价单
+        │     │
+        │     └── 记录 OrderHistory + JSON 持久化
+        │
+        └── 等待下一轮
 ```
 
-**工作流程**：
-1. 🔍 检测到仓位盈利达到目标（如30%）
-2. 💰 立即执行市价平仓，锁定盈利
-3. 📝 记录盈利退出事件到历史
-4. 🔄 重置该symbol的订单处理状态
-5. ⏭️ 下个轮询周期检测到OID变化，自动重新跟单
+### WebSocket 事件驱动
 
-**安全特性**：
-- 🛡️ 重新跟单前进行价格容忍度检查
-- 📊 保留agent原始的止盈止损计划
-- 🔄 可选功能，默认关闭避免意外影响
-- 📝 完整的操作日志记录
-
-**使用建议**：
-- 🎯 保守策略：`--profit 20` （20%盈利退出）
-- ⚖️ 平衡策略：`--profit 30 --auto-refollow` （30%盈利退出并重新跟单）
-- 🚀 积极策略：`--profit 50 --auto-refollow` （50%盈利退出并重新跟单）
-
-### 使用示例
-
-**新手入门**：
-```bash
-# 1. 检查系统配置
-npm start -- status
-
-# 2. 查看可用Agent
-npm start -- agents
-
-# 3. 风险控制模式测试
-npm start -- follow buynhold_btc --risk-only
-
-# 4. 单次跟单测试
-npm start -- follow deepseek-chat-v3.1
-
-# 5. 查看盈利统计
-npm start -- profit
+```
+HL WebSocket userFills
+      │
+      ▼
+  收到 fill 事件
+      │
+      ▼
+  立即触发 REST 轮询（不等定时器）
+      │
+      ▼
+  检测到仓位变化 → 执行跟单
 ```
 
-**持续监控**：
-```bash
-# 每30秒检查一次
-npm start -- follow gpt-5 --interval 30
+WebSocket 连接管理：
+- 每 50s 发送心跳 ping
+- 断线自动重连（指数退避，1s → 30s，最多 100 次）
+- 重连后自动重新订阅 userFills
+- WebSocket 连接失败时自动降级为纯 REST 轮询模式
 
-# 多Agent并行监控（不同终端）
-npm start -- follow gpt-5 --interval 30
-npm start -- follow deepseek-chat-v3.1 --interval 45
-npm start -- follow claude-sonnet-4-5 --interval 60 --risk-only
-```
-
-**盈利分析**：
-```bash
-# 查看总盈利情况（默认包含浮动盈亏）
-npm start -- profit
-
-# 仅查看已实现盈利（排除浮动盈亏）
-npm start -- profit --exclude-unrealized
-
-# 仅查看当前仓位的浮动盈亏
-npm start -- profit --unrealized-only
-
-# 按不同时间范围分析
-npm start -- profit --since 1d      # 最近1天
-npm start -- profit --since 7d      # 最近1周
-npm start -- profit --since 30d     # 最近1月
-
-# 按交易对分析
-npm start -- profit --pair BTCUSDT --since 7d
-npm start -- profit --pair ETHUSDT --format json
-
-# JSON格式输出（默认包含浮动盈亏）
-npm start -- profit --format json
-
-# 仅浮动盈亏的JSON格式输出
-npm start -- profit --unrealized-only --format json
-```
-
-## 📊 架构概览
+## 项目结构
 
 ```
 src/
-├── commands/               # 命令处理器
-│   ├── agents.ts          # 获取AI Agent列表
-│   ├── follow.ts          # 跟单命令（核心）
-│   ├── profit.ts          # 盈利统计分析
-│   └── status.ts          # 系统状态检查
-├── services/              # 核心服务
-│   ├── api-client.ts      # Nof1 API客户端
-│   ├── binance-service.ts # Binance API集成
-│   ├── trading-executor.ts # 交易执行引擎
-│   ├── position-manager.ts # 仓位管理
-│   ├── profit-calculator.ts # 盈利计算引擎
-│   ├── trade-history-service.ts # 交易历史服务
-│   ├── order-history-manager.ts # 订单历史管理
-│   └── futures-capital-manager.ts # 合约资金管理
-├── scripts/
-│   └── analyze-api.ts     # API分析引擎（跟单策略）
-├── types/                 # TypeScript类型定义
-├── utils/                 # 工具函数
-└── index.ts               # CLI入口点
+├── config/
+│   └── constants.ts          # 配置常量 + 环境变量构建
+├── types/
+│   └── index.ts              # 所有类型定义（零循环依赖）
+│                                - HL 链上类型（HlPosition, HlFill, HlClearinghouseState...）
+│                                - 镜像交易类型（MirrorPosition, PositionDelta, TradeSignal...）
+│                                - 执行结果类型（ExecutionResult, StopOrderResult...）
+│                                - 配置类型（AppConfig, FollowOptions...）
+│                                - Symbol 映射（HL coin ↔ Binance symbol）
+├── utils/
+│   ├── logger.ts              # 分级日志（ERROR/WARN/INFO/DEBUG/VERBOSE）
+│   └── errors.ts              # 错误类 + 重试工具（retryWithBackoff）
+├── services/
+│   ├── hyperliquid-client.ts  # HL REST API 客户端
+│   │                            - getClearinghouseState() 获取地址持仓
+│   │                            - getUserFills() 获取成交记录
+│   │                            - getUserFillsByTime() 按时间查询成交
+│   │                            - getOpenOrders() 获取挂单
+│   │                            - getMeta() 获取交易对元数据
+│   ├── hyperliquid-ws.ts      # HL WebSocket 客户端
+│   │                            - 自动重连（指数退避，最多 100 次）
+│   │                            - 心跳保活（50s ping）
+│   │                            - 订阅管理（subscribeToFills/unsubscribeFromFills）
+│   │                            - 事件发射：fill / connected / disconnected / error
+│   ├── binance-service.ts      # Binance 期货 API（HMAC-SHA256 签名）
+│   │                            - 下单/撤单/查仓/设杠杆/设保证金模式
+│   │                            - 自动时间同步 + 时间戳错误重试
+│   │                            - 交易对精度缓存
+│   ├── position-tracker.ts    # 仓位状态追踪 & Delta 检测引擎
+│   │                            - initialize() 初始化基线快照
+│   │                            - detectChanges() 比对变化
+│   │                            - 支持 6 种 Delta 类型检测
+│   ├── trade-executor.ts      # 交易执行引擎
+│   │                            - executeSignal() 执行跟单信号
+│   │                            - closePosition() 平仓
+│   │                            - placeStopOrders() 设置止盈止损
+│   │                            - cleanOrphanedOrders() 清理孤儿单
+│   │                            - 自动初始化 symbol 配置（杠杆+保证金模式+精度）
+│   ├── risk-manager.ts        # 风险评估 & 信号构建
+│   │                            - buildSignalFromDelta() 将仓位变化转为交易信号
+│   │                            - checkPriceTolerance() 价格容差检查
+│   │                            - assessRisk() 风险评估
+│   ├── capital-manager.ts      # 保证金分配 & 仓位计算
+│   │                            - allocateForSinglePosition() 单仓分配
+│   │                            - allocateForDelta() 增量分配
+│   │                            - 余额不足时自动缩减
+│   ├── order-history.ts        # 订单历史持久化（JSON 文件）
+│   │                            - 去重（symbol + side + hlFillTime）
+│   │                            - 定期清理过期记录
+│   └── mirror-engine.ts        # 核心编排引擎
+│                                - WebSocket + REST 联动
+│                                - 6 种 Delta 处理路由
+│                                - 优雅关闭（SIGINT/SIGTERM）
+└── index.ts                    # CLI 入口
+                                 - follow: 启动跟单
+                                 - status: 检查连接
+                                 - positions: 查看持仓
 ```
 
-**核心流程**：
+## 配置参考
+
+```env
+# Hyperliquid
+HYPERLIQUID_TARGET_ADDRESS=0x...     # 必填：跟单目标地址
+HYPERLIQUID_TESTNET=false              # 测试网开关
+HYPERLIQUID_POLL_INTERVAL_MS=3000      # REST 轮询间隔（毫秒）
+
+# Binance
+BINANCE_API_KEY=...                    # 必填：币安 API Key
+BINANCE_API_SECRET=...                 # 必填：币安 API Secret
+BINANCE_TESTNET=true                   # 强烈建议先用测试网
+
+# 交易参数
+MAX_POSITION_SIZE=1000                 # 最大仓位 USDT
+DEFAULT_LEVERAGE=10                    # 默认杠杆
+TOTAL_MARGIN_USDT=100                 # 跟单总保证金
+MARGIN_TYPE=CROSSED                    # 保证金模式（ISOLATED / CROSSED）
+PRICE_TOLERANCE_PERCENT=1.0            # 价格容差 %
+RISK_PERCENTAGE=2.0                    # 风险百分比
+
+# 日志
+LOG_LEVEL=INFO                         # ERROR|WARN|INFO|DEBUG|VERBOSE
 ```
-跟单流程：
-用户命令 → follow命令处理器 → ApiAnalyzer分析Agent信号
-         ↓
-    识别交易动作（开仓/平仓/换仓/止盈止损）
-         ↓
-    生成FollowPlan → TradingExecutor执行
-         ↓
-    BinanceService → Binance API → 交易完成
 
-盈利分析流程：
-用户命令 → profit命令处理器 → TradeHistoryService获取历史交易
-         ↓
-    ProfitCalculator计算盈利（基于realizedPnl和手续费）
-         ↓
-    生成统计报告（基础统计、分组统计、风险指标）
-         ↓
-    输出结果（表格/JSON格式）
-```
+## 风险提示
 
-## ⚠️ 重要提示
+- **⚠️ 合约交易风险**：杠杆交易可能导致快速亏损，请谨慎使用
+- **🧪 先用测试网**：强烈建议先在 Binance Testnet 测试
+- **📊 链上延迟**：WebSocket 推送 + REST 轮询，可能存在秒级延迟
+- **💸 滑点风险**：市价单可能有滑点，通过价格容差控制
+- **🔄 重连机制**：WebSocket 断线自动重连（指数退避，最多 100 次）
+- **🔒 私钥安全**：本工具仅需读取链上公开数据，**不需要**私钥
 
-### 风险提示
-
-- **⚠️ 合约交易风险**: 合约交易使用杠杆，可能导致快速亏损，请谨慎使用
-- **🧪 测试环境**: 强烈建议先在 Binance Testnet 测试
-- **📊 风险管理**: 建议杠杆≤10x，使用专门的交易账户
-- **💡 风险控制模式**: 新手建议先使用`--risk-only`模式观察
-- **📈 跟单风险**: AI Agent的策略不保证盈利，请自行评估风险
-
-### 安全建议
-
-- 设置IP白名单限制访问
-- 定期更换API密钥
-- 不要在代码中硬编码密钥
-- 避免投入无法承受损失的资金
-
-## 🔍 故障排除
-
-### 常见问题
-
-**1. 合约交易权限不足**
-```
-Error: Insufficient permissions
-```
-- ✅ 确保在Binance API管理页面启用了 **Enable Futures** 权限
-- ✅ 确保启用了 **Enable Reading** 权限
-- 重新创建API密钥并正确配置权限
-
-**2. Agent不存在**
-```
-Error: Agent xxx not found
-```
-- 使用`npm start -- agents`查看可用Agent列表
-- 确认Agent名称拼写正确（区分大小写）
-
-**3. 网络连接问题**
-```
-Error: timeout
-```
-- 检查网络连接和防火墙设置
-- 如果在中国大陆，可能需要使用VPN访问Binance API
-
-**4. API密钥错误**
-```
-Error: Invalid API Key
-```
-- 检查`.env`文件中的API密钥是否正确
-- 确认API密钥没有过期
-- 验证是否复制了完整的密钥（没有多余空格）
-
-## 🔧 开发
+## 开发
 
 ```bash
-# 运行测试
-npm test
-
-# 开发模式（自动重启）
-npm run dev
-
-# 构建
-npm run build
-
-# 代码检查
-npm run lint
+npm install       # 安装依赖
+npm run dev       # 开发模式（ts-node）
+npm run build     # 编译 TypeScript
+npm run lint      # 代码检查
+npm run format    # 代码格式化
 ```
 
-## 📚 更多文档
+## 从 v1 迁移
 
-- **[详细跟单策略文档](./docs/follow-strategy.md)** - 完整的跟单策略和风险评估
-- **[快速参考手册](./docs/quick-reference.md)** - 常用命令快速查询
+如果你从 `nof1-tracker` v1 升级，注意以下破坏性变更：
 
-## ⭐ Star History
+1. **环境变量**：移除 `NOF1_API_BASE_URL`，新增 `HYPERLIQUID_TARGET_ADDRESS`、`HYPERLIQUID_TESTNET`、`HYPERLIQUID_POLL_INTERVAL_MS`、`TOTAL_MARGIN_USDT`、`MARGIN_TYPE`、`PRICE_TOLERANCE_PERCENT`
+2. **命令变更**：
+   - `follow <agent>` → `follow [--address <addr>]`（不再跟 Agent，改为跟链上地址）
+   - 移除 `agents` 命令
+   - 移除 `profit` 命令
+   - 新增 `positions <address>` 命令
+3. **数据目录**：`data/order-history.json` 格式不兼容，需要清空重新开始
+4. **依赖变更**：移除 `winston`、`querystring`，新增 `ws`
 
-[![Star History Chart](https://api.star-history.com/svg?repos=terryso/nof1-tracker&type=date&legend=top-left)](https://www.star-history.com/#terryso/nof1-tracker&type=date&legend=top-left)
+## 许可证
 
-## 📄 许可证
-
-MIT License - 查看 [LICENSE](LICENSE) 文件了解详情
-
----
-
-**免责声明**: 本工具仅供学习和测试使用。实际交易存在资金损失风险，请谨慎使用并遵守相关法律法规。
+MIT License

@@ -1,94 +1,147 @@
-#!/usr/bin/env node
-
 import { Command } from 'commander';
-import * as dotenv from 'dotenv';
-import {
-  handleAgentsCommand,
-  handleFollowCommand,
-  handleStatusCommand,
-  handleProfitCommand,
-  ProfitCommandOptions
-} from './commands';
-import { handleError, getVersion } from './utils/command-helpers';
+import dotenv from 'dotenv';
+import { buildConfigFromEnv } from './config/constants';
+import { setLogLevel } from './utils/logger';
+import { MirrorEngine } from './services/mirror-engine';
 
-// Load environment variables
 dotenv.config();
-
-// ============================================================================
-// CLI Program Setup
-// ============================================================================
 
 const program = new Command();
 
 program
-  .name('nof1-trade')
-  .description('CLI tool for automated contract trading based on nof1 AI agents')
-  .version(getVersion());
+  .name('hl-cex-tracker')
+  .description('Mirror Hyperliquid on-chain positions to Binance Futures')
+  .version('2.0.0');
 
-// ============================================================================
-// Command Registration
-// ============================================================================
-
-// List agents command
 program
-  .command('agents')
-  .description('List all available AI agents')
-  .action(async () => {
+  .command('follow')
+  .description('Start mirroring positions from Hyperliquid to Binance')
+  .option('-a, --address <address>', 'Hyperliquid address to follow (overrides env)')
+  .option('-m, --total-margin <usdt>', 'Total margin in USDT', parseFloat)
+  .option('--margin-type <type>', 'Margin type: ISOLATED or CROSSED', 'CROSSED')
+  .option('-p, --price-tolerance <percent>', 'Max price deviation % to still execute', parseFloat)
+  .option('--max-position-size <usdt>', 'Max position size in USDT', parseFloat)
+  .option('--dry-run', 'Simulate without executing trades', false)
+  .option('-l, --log-level <level>', 'Log level: ERROR|WARN|INFO|DEBUG|VERBOSE', 'INFO')
+  .action(async (options) => {
+    setLogLevel(options.logLevel);
+
+    const envConfig = buildConfigFromEnv();
+    if (options.address) {
+      envConfig.hyperliquid.targetAddress = options.address;
+    }
+
+    if (!envConfig.hyperliquid.targetAddress) {
+      console.error('Error: HYPERLIQUID_TARGET_ADDRESS is required. Set it in .env or pass --address');
+      process.exit(1);
+    }
+
+    if (!envConfig.binance.apiKey || !envConfig.binance.apiSecret) {
+      console.error('Error: BINANCE_API_KEY and BINANCE_API_SECRET are required.');
+      process.exit(1);
+    }
+
+    const engine = new MirrorEngine(envConfig);
+
+    const gracefulShutdown = async () => {
+      console.log('\nShutting down gracefully...');
+      await engine.stop();
+      process.exit(0);
+    };
+
+    process.on('SIGINT', gracefulShutdown);
+    process.on('SIGTERM', gracefulShutdown);
+
     try {
-      await handleAgentsCommand();
+      await engine.start({
+        totalMargin: options.totalMargin,
+        marginType: options.marginType,
+        priceTolerance: options.priceTolerance,
+        maxPositionSize: options.maxPositionSize,
+        dryRun: options.dryRun,
+      });
+      console.log('Mirror engine running. Press Ctrl+C to stop.');
     } catch (error) {
-      handleError(error, 'Failed to fetch agents');
+      console.error('Fatal error:', error);
+      process.exit(1);
     }
   });
 
-// Follow agent command
-program
-  .command('follow <agent-name>')
-  .description('Follow a specific AI agent and copy their trades')
-  .option('-r, --risk-only', 'only perform risk assessment without executing trades')
-  .option('-i, --interval <seconds>', 'polling interval in seconds for continuous monitoring', '30')
-  .option('-t, --price-tolerance <percentage>', 'set price tolerance threshold (default: 1%)', parseFloat)
-  .option('-m, --total-margin <amount>', 'set total margin for futures trading (default: 10 USDT)', parseFloat)
-  .option('--profit <percentage>', 'auto exit when profit reaches specified percentage (e.g., 30 for 30%)', parseFloat)
-  .option('--auto-refollow', 'automatically refollow after profit target exit (default: false)')
-  .option('--margin-type <type>', 'margin mode: ISOLATED (isolated) or CROSSED (cross, default)', 'CROSSED')
-  .action(async (agentName, options) => {
-    try {
-      await handleFollowCommand(agentName, options);
-    } catch (error) {
-      handleError(error, 'Follow agent failed');
-    }
-  });
-
-// Status command
 program
   .command('status')
-  .description('Check system status and configuration')
-  .action(() => {
-    handleStatusCommand();
-  });
+  .description('Check connection status to Hyperliquid and Binance')
+  .option('-l, --log-level <level>', 'Log level', 'INFO')
+  .action(async (options) => {
+    setLogLevel(options.logLevel);
+    const config = buildConfigFromEnv();
 
-// Profit command
-program
-  .command('profit')
-  .description('Analyze profit/loss statistics for futures trades')
-  .option('-s, --since <time>', 'time filter: "7d" (last 7 days), "2024-01-01" (since date), or timestamp. If not specified, uses order history start time')
-  .option('-p, --pair <symbol>', 'specific trading pair (e.g., BTCUSDT)')
-  .option('--group-by <type>', 'group results by symbol or all', 'all')
-  .option('--format <type>', 'output format: table or json', 'table')
-  .option('--refresh', 'force refresh cache and fetch fresh data')
-  .option('--exclude-unrealized', 'exclude current positions unrealized P&L from analysis')
-  .option('--unrealized-only', 'show only current positions unrealized P&L')
-  .action(async (options: ProfitCommandOptions) => {
+    const { HyperliquidClient } = await import('./services/hyperliquid-client');
+    const { BinanceService } = await import('./services/binance-service');
+
+    console.log('Checking connections...\n');
+
     try {
-      await handleProfitCommand(options);
+      const hlClient = new HyperliquidClient(config.hyperliquid.apiUrl);
+      if (config.hyperliquid.targetAddress) {
+        const state = await hlClient.getClearinghouseState(config.hyperliquid.targetAddress);
+        const positions = state.assetPositions.filter((ap) => parseFloat(ap.position.szi) !== 0);
+        console.log(`✓ Hyperliquid connected. ${positions.length} active position(s) for ${config.hyperliquid.targetAddress}`);
+        for (const ap of positions) {
+          console.log(`  ${ap.position.coin}: ${ap.position.szi} @ ${ap.position.entryPx} (${ap.position.leverage.value}x ${ap.position.leverage.type})`);
+        }
+      } else {
+        console.log('✗ HYPERLIQUID_TARGET_ADDRESS not configured');
+      }
     } catch (error) {
-      handleError(error, 'Profit analysis failed');
+      console.log(`✗ Hyperliquid connection failed: ${(error as Error).message}`);
+    }
+
+    try {
+      const binance = new BinanceService(config.binance.apiKey, config.binance.apiSecret, config.binance.testnet);
+      await binance.syncServerTime();
+      const account = await binance.getAccountInfo();
+      console.log(`✓ Binance connected. Balance: ${account.availableBalance} USDT (testnet: ${config.binance.testnet})`);
+    } catch (error) {
+      console.log(`✗ Binance connection failed: ${(error as Error).message}`);
     }
   });
 
-// ============================================================================
-// Parse CLI Arguments
-// ============================================================================
+program
+  .command('positions <address>')
+  .description('Show current positions for a Hyperliquid address')
+  .option('-l, --log-level <level>', 'Log level', 'INFO')
+  .action(async (address: string, options) => {
+    setLogLevel(options.logLevel);
+    const config = buildConfigFromEnv();
+    const { HyperliquidClient } = await import('./services/hyperliquid-client');
+    const { hlCoinToBinanceSymbol, parseHlPosition } = await import('./types');
+
+    const hlClient = new HyperliquidClient(config.hyperliquid.apiUrl);
+    try {
+      const state = await hlClient.getClearinghouseState(address);
+      console.log(`\nAccount value: ${state.marginSummary.accountValue} USDT`);
+      console.log(`Total margin used: ${state.marginSummary.totalMarginUsed} USDT`);
+      console.log(`Withdrawable: ${state.withdrawable} USDT\n`);
+
+      const activePositions = state.assetPositions.filter((ap) => parseFloat(ap.position.szi) !== 0);
+      if (activePositions.length === 0) {
+        console.log('No active positions.');
+        return;
+      }
+
+      console.log('Active positions:');
+      for (const ap of activePositions) {
+        const mirrorPos = parseHlPosition(ap);
+        if (mirrorPos) {
+          console.log(
+            `  ${ap.position.coin} (${mirrorPos.symbol}): ${mirrorPos.side} ${mirrorPos.size} @ ${mirrorPos.entryPrice}\n` +
+            `    Leverage: ${mirrorPos.leverage}x ${mirrorPos.marginType} | PnL: ${mirrorPos.unrealizedPnl} | Liq: ${mirrorPos.liquidationPrice ?? 'N/A'}`,
+          );
+        }
+      }
+    } catch (error) {
+      console.error(`Error: ${(error as Error).message}`);
+    }
+  });
 
 program.parse();

@@ -1,137 +1,147 @@
-import { TradingPlan } from "../types/trading";
-import { ConfigManager } from "./config-manager";
-
-export interface PriceToleranceCheck {
-  entryPrice: number;
-  currentPrice: number;
-  priceDifference: number; // Percentage difference
-  tolerance: number; // Tolerance threshold in percentage
-  withinTolerance: boolean;
-  shouldExecute: boolean;
-  reason: string;
-}
-
-export interface RiskAssessment {
-  isValid: boolean;
-  riskScore: number;
-  warnings: string[];
-  maxLoss: number;
-  suggestedPositionSize: number;
-  priceTolerance?: PriceToleranceCheck;
-}
+import { PositionDelta, TradeSignal, MirrorPosition, PriceToleranceCheck } from '../types';
+import { logInfo, logWarn } from '../utils/logger';
 
 export class RiskManager {
-  private configManager: ConfigManager;
+  private priceTolerancePercent: number;
+  private maxPositionSizeUsdt: number;
 
-  constructor(configManager?: ConfigManager) {
-    this.configManager = configManager || new ConfigManager();
+  constructor(priceTolerancePercent: number = 1.0, maxPositionSizeUsdt: number = 1000) {
+    this.priceTolerancePercent = priceTolerancePercent;
+    this.maxPositionSizeUsdt = maxPositionSizeUsdt;
   }
 
-  assessRisk(tradingPlan: TradingPlan): RiskAssessment {
-    // Basic risk assessment logic
-    const riskScore = this.calculateRiskScore(tradingPlan);
-    const warnings = this.generateWarnings(tradingPlan, riskScore);
-
-    return {
-      isValid: riskScore <= 100, // Risk score threshold
-      riskScore,
-      warnings,
-      maxLoss: tradingPlan.quantity * 1000, // Simplified calculation
-      suggestedPositionSize: tradingPlan.quantity
-    };
-  }
-
-  /**
-   * 计算价格差异百分比
-   */
-  calculatePriceDifference(entryPrice: number, currentPrice: number): number {
-    if (entryPrice <= 0) {
-      throw new Error('Entry price must be greater than 0');
-    }
-    return Math.abs((currentPrice - entryPrice) / entryPrice) * 100;
-  }
-
-  /**
-   * 检查价格是否在容忍范围内
-   */
-  checkPriceTolerance(
-    entryPrice: number,
-    currentPrice: number,
-    symbol?: string,
-    customTolerance?: number
-  ): PriceToleranceCheck {
-    const tolerance = customTolerance || this.configManager.getPriceTolerance(symbol);
-    const priceDifference = this.calculatePriceDifference(entryPrice, currentPrice);
-    const withinTolerance = priceDifference <= tolerance;
-
+  checkPriceTolerance(entryPrice: number, currentPrice: number, symbol?: string): PriceToleranceCheck {
+    const priceDifference = Math.abs(currentPrice - entryPrice) / entryPrice * 100;
     return {
       entryPrice,
       currentPrice,
       priceDifference,
-      tolerance,
-      withinTolerance,
-      shouldExecute: withinTolerance,
-      reason: withinTolerance
-        ? `Price difference ${priceDifference.toFixed(2)}% is within tolerance ${tolerance}%`
-        : `Price difference ${priceDifference.toFixed(2)}% exceeds tolerance ${tolerance}%`
+      tolerance: this.priceTolerancePercent,
+      shouldExecute: priceDifference <= this.priceTolerancePercent,
     };
   }
 
-  /**
-   * 包含价格容忍度检查的风险评估
-   */
-  assessRiskWithPriceTolerance(
-    tradingPlan: TradingPlan,
-    entryPrice: number,
-    currentPrice: number,
-    symbol?: string,
-    customTolerance?: number
-  ): RiskAssessment {
-    // Get basic risk assessment
-    const basicAssessment = this.assessRisk(tradingPlan);
+  buildSignalFromDelta(delta: PositionDelta, currentPrice?: number): TradeSignal | null {
+    const { type, symbol, previous, current } = delta;
 
-    // Add price tolerance check
-    const priceTolerance = this.checkPriceTolerance(entryPrice, currentPrice, symbol, customTolerance);
+    switch (type) {
+      case 'NEW': {
+        if (!current) return null;
+        const side = current.side === 'LONG' ? 'BUY' : 'SELL';
+        return {
+          action: 'ENTER',
+          symbol: current.symbol,
+          side,
+          quantity: current.size,
+          leverage: current.leverage,
+          marginType: current.marginType,
+          reason: `New ${current.side} position on HL: ${current.size} @ ~${current.entryPrice}`,
+          sourceDelta: delta,
+        };
+      }
 
-    // Combine warnings
-    const combinedWarnings = [...basicAssessment.warnings];
-    if (!priceTolerance.withinTolerance) {
-      combinedWarnings.push(`Price tolerance check failed: ${priceTolerance.reason}`);
+      case 'CLOSED': {
+        if (!previous) return null;
+        const side = previous.side === 'LONG' ? 'SELL' : 'BUY';
+        return {
+          action: 'EXIT',
+          symbol: previous.symbol,
+          side,
+          quantity: previous.size,
+          leverage: previous.leverage,
+          marginType: previous.marginType,
+          reason: `Closed ${previous.side} position on HL`,
+          sourceDelta: delta,
+        };
+      }
+
+      case 'SIDE_FLIPPED': {
+        if (!previous || !current) return null;
+        const closeSide = previous.side === 'LONG' ? 'SELL' : 'BUY';
+        const enterSide = current.side === 'LONG' ? 'BUY' : 'SELL';
+        return {
+          action: 'MODIFY',
+          symbol: current.symbol,
+          side: enterSide,
+          quantity: current.size,
+          leverage: current.leverage,
+          marginType: current.marginType,
+          reason: `Flipped from ${previous.side} to ${current.side} on HL`,
+          sourceDelta: delta,
+        };
+      }
+
+      case 'INCREASED': {
+        if (!current || !previous) return null;
+        const diff = current.size - previous.size;
+        const side = current.side === 'LONG' ? 'BUY' : 'SELL';
+        return {
+          action: 'ENTER',
+          symbol: current.symbol,
+          side,
+          quantity: diff,
+          leverage: current.leverage,
+          marginType: current.marginType,
+          reason: `Increased ${current.side} position by ${diff.toFixed(4)} on HL`,
+          sourceDelta: delta,
+        };
+      }
+
+      case 'DECREASED': {
+        if (!current || !previous) return null;
+        const diff = previous.size - current.size;
+        const side = previous.side === 'LONG' ? 'SELL' : 'BUY';
+        return {
+          action: 'EXIT',
+          symbol: current.symbol,
+          side,
+          quantity: diff,
+          leverage: current.leverage,
+          marginType: current.marginType,
+          reason: `Decreased ${previous.side} position by ${diff.toFixed(4)} on HL`,
+          sourceDelta: delta,
+        };
+      }
+
+      case 'LEVERAGE_CHANGED': {
+        if (!current) return null;
+        logInfo(`[Risk] Leverage/margin change for ${symbol}: ${previous?.leverage}x ${previous?.marginType} -> ${current.leverage}x ${current.marginType}`);
+        return {
+          action: 'MODIFY',
+          symbol: current.symbol,
+          side: current.side === 'LONG' ? 'BUY' : 'SELL',
+          quantity: 0,
+          leverage: current.leverage,
+          marginType: current.marginType,
+          reason: `Leverage changed to ${current.leverage}x ${current.marginType} on HL`,
+          sourceDelta: delta,
+        };
+      }
+
+      default:
+        return null;
     }
-
-    return {
-      ...basicAssessment,
-      warnings: combinedWarnings,
-      priceTolerance,
-      isValid: basicAssessment.isValid && priceTolerance.withinTolerance
-    };
   }
 
-  /**
-   * 获取配置管理器
-   */
-  getConfigManager(): ConfigManager {
-    return this.configManager;
-  }
-
-  private calculateRiskScore(tradingPlan: TradingPlan): number {
-    // Simple risk scoring based on leverage and quantity
-    const leverageRisk = tradingPlan.leverage * 10;
-    const baseScore = 20;
-    return Math.min(baseScore + leverageRisk, 100);
-  }
-
-  private generateWarnings(tradingPlan: TradingPlan, riskScore: number): string[] {
+  assessRisk(signal: TradeSignal, notionalValue: number): { approved: boolean; warnings: string[] } {
     const warnings: string[] = [];
 
-    if (tradingPlan.leverage > 20) {
-      warnings.push("High leverage detected");
+    if (signal.leverage > 20) {
+      warnings.push(`High leverage: ${signal.leverage}x (recommended ≤20x)`);
     }
 
-    if (riskScore > 80) {
-      warnings.push("High risk score");
+    if (notionalValue > this.maxPositionSizeUsdt) {
+      warnings.push(`Position size ${notionalValue.toFixed(2)} USDT exceeds max ${this.maxPositionSizeUsdt} USDT`);
     }
 
-    return warnings;
+    return { approved: true, warnings };
+  }
+
+  setPriceTolerance(tolerance: number): void {
+    this.priceTolerancePercent = tolerance;
+  }
+
+  setMaxPositionSize(size: number): void {
+    this.maxPositionSizeUsdt = size;
   }
 }
