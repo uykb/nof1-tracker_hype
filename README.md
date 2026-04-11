@@ -69,7 +69,7 @@ npm start -- follow
 npm start -- follow -a 0x1234...
 
 # 设置总保证金
-npm start -- follow -m 500
+npm start -- follow -r 0.1
 
 # 设置保证金模式
 npm start -- follow --margin-type ISOLATED
@@ -81,7 +81,7 @@ npm start -- follow -p 2.0
 npm start -- follow --dry-run
 
 # 组合使用
-npm start -- follow -a 0x... -m 200 --margin-type CROSSED -p 1.5 --dry-run
+npm start -- follow -a 0x... -r 0.5 --margin-type CROSSED -p 1.5 --dry-run
 ```
 
 **选项**：
@@ -89,10 +89,9 @@ npm start -- follow -a 0x... -m 200 --margin-type CROSSED -p 1.5 --dry-run
 | 选项 | 简写 | 说明 | 默认值 |
 |------|------|------|--------|
 | `--address` | `-a` | Hyperliquid 地址 | .env 配置 |
-| `--total-margin` | `-m` | 总保证金 (USDT) | 100 |
+| `--ratio` | `-r` | 跟单比例（1.0=等比，0.1=10%）| 1.0 |
 | `--margin-type` | | 保证金模式 | CROSSED |
 | `--price-tolerance` | `-p` | 价格容差 (%) | 1.0 |
-| `--max-position-size` | | 最大仓位数 (USDT) | 1000 |
 | `--dry-run` | | 试运行，不执行交易 | false |
 | `--log-level` | `-l` | 日志级别 | INFO |
 
@@ -128,10 +127,9 @@ npm start -- positions 0xYourAddress
 ### 风控机制
 
 1. **价格容差检查**：源地址入场价与当前市价偏差超过阈值时跳过（默认 1%）
-2. **最大仓位限制**：单仓名义价值不超过设定上限（默认 1000 USDT）
-3. **孤儿单清理**：每轮轮询前清理无对应持仓的止盈止损单
-4. **保证金检查**：余额不足时自动缩减仓位至 95% 可用余额，仍不足则跳过
-5. **杠杆警告**：杠杆超过 20x 时输出警告日志
+2. **孤儿单清理**：每轮轮询前清理无对应持仓的止盈止损单
+3. **杠杆跟随**：始终使用源地址的杠杆倍数，不使用回退默认值
+4. **保证金模式跟随**：始终使用源地址的保证金模式（全仓/逐仓）
 
 ### 执行流程
 
@@ -268,12 +266,9 @@ BINANCE_API_SECRET=...                 # 必填：币安 API Secret
 BINANCE_TESTNET=true                   # 强烈建议先用测试网
 
 # 交易参数
-MAX_POSITION_SIZE=1000                 # 最大仓位 USDT
-DEFAULT_LEVERAGE=10                    # 默认杠杆
-TOTAL_MARGIN_USDT=100                 # 跟单总保证金
+FIXED_RATIO=1.0                        # 跟单比例：1.0=等比，0.1=10%，2.0=2倍
 MARGIN_TYPE=CROSSED                    # 保证金模式（ISOLATED / CROSSED）
 PRICE_TOLERANCE_PERCENT=1.0            # 价格容差 %
-RISK_PERCENTAGE=2.0                    # 风险百分比
 
 # 日志
 LOG_LEVEL=INFO                         # ERROR|WARN|INFO|DEBUG|VERBOSE

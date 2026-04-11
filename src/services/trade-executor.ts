@@ -1,6 +1,5 @@
 import { BinanceService } from './binance-service';
-import { PositionDelta, TradeSignal, ExecutionResult, StopOrderResult } from '../types';
-import { TRADING_CONFIG } from '../config/constants';
+import { TradeSignal, ExecutionResult, StopOrderResult } from '../types';
 import { logInfo, logDebug, logWarn, logError } from '../utils/logger';
 
 export class TradeExecutor {

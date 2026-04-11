@@ -5,10 +5,8 @@ import { PositionTracker } from './position-tracker';
 import { BinanceService } from './binance-service';
 import { TradeExecutor } from './trade-executor';
 import { RiskManager } from './risk-manager';
-import { CapitalManager } from './capital-manager';
 import { OrderHistoryManager } from './order-history';
-import { AppConfig, PositionDelta, TradeSignal, HlFill, FollowOptions } from '../types';
-import { TRADING_CONFIG } from '../config/constants';
+import { AppConfig, FollowOptions, HlFill, PositionDelta, TradeSignal } from '../types';
 import { logInfo, logDebug, logWarn, logError } from '../utils/logger';
 
 export class MirrorEngine extends EventEmitter {
@@ -18,7 +16,6 @@ export class MirrorEngine extends EventEmitter {
   private binance: BinanceService;
   private executor: TradeExecutor;
   private riskManager: RiskManager;
-  private capitalManager: CapitalManager;
   private orderHistory: OrderHistoryManager;
   private pollTimer: NodeJS.Timer | null = null;
   private isRunning = false;
@@ -30,8 +27,7 @@ export class MirrorEngine extends EventEmitter {
     this.tracker = new PositionTracker(this.hlClient);
     this.binance = new BinanceService(config.binance.apiKey, config.binance.apiSecret, config.binance.testnet);
     this.executor = new TradeExecutor(this.binance);
-    this.riskManager = new RiskManager(config.trading.priceTolerancePercent, config.trading.maxPositionSizeUsdt);
-    this.capitalManager = new CapitalManager(config.trading.totalMarginUsdt);
+    this.riskManager = new RiskManager(config.trading.priceTolerancePercent);
     this.orderHistory = new OrderHistoryManager();
   }
 
@@ -41,11 +37,18 @@ export class MirrorEngine extends EventEmitter {
       return;
     }
 
-    const opts = this.mergeOptions(options);
+    const ratio = options?.ratio ?? this.config.trading.fixedRatio;
+    const marginType = options?.marginType ?? this.config.trading.marginType;
+    const dryRun = options?.dryRun ?? false;
+
     logInfo('[Mirror] Starting Hyperliquid → Binance mirror engine');
     logInfo(`[Mirror] Target: ${this.config.hyperliquid.targetAddress}`);
     logInfo(`[Mirror] Binance: ${this.config.binance.testnet ? 'TESTNET' : 'MAINNET'}`);
-    logInfo(`[Mirror] Total margin: ${opts.totalMargin} USDT, Margin type: ${opts.marginType}`);
+    logInfo(`[Mirror] Ratio: ${ratio}, Margin type: ${marginType}, Dry run: ${dryRun}`);
+
+    if (options?.priceTolerance !== undefined) {
+      this.riskManager.setPriceTolerance(options.priceTolerance);
+    }
 
     this.isRunning = true;
 
@@ -66,7 +69,7 @@ export class MirrorEngine extends EventEmitter {
       logWarn(`[Mirror] WebSocket connection failed, falling back to polling only: ${(error as Error).message}`);
     }
 
-    this.startPolling(opts);
+    this.startPolling();
     logInfo('[Mirror] Polling started');
     this.emit('started');
   }
@@ -105,7 +108,7 @@ export class MirrorEngine extends EventEmitter {
     });
   }
 
-  private startPolling(opts: Required<FollowOptions>): void {
+  private startPolling(): void {
     this.stopPolling();
     const interval = this.config.hyperliquid.pollIntervalMs;
     this.pollTimer = setInterval(async () => {
@@ -144,29 +147,29 @@ export class MirrorEngine extends EventEmitter {
   }
 
   private async processDelta(delta: PositionDelta): Promise<void> {
-    const signal = this.riskManager.buildSignalFromDelta(delta);
+    const opts = this.mergeOptions();
+    const signal = this.riskManager.buildSignalFromDelta(delta, opts.ratio);
     if (!signal) {
       logDebug(`[Mirror] No signal for delta type ${delta.type} on ${delta.symbol}`);
       return;
     }
 
-    logInfo(`[Mirror] Delta: ${delta.type} ${delta.symbol} → Signal: ${signal.action} ${signal.side} ${signal.quantity}`);
+    logInfo(`[Mirror] Delta: ${delta.type} ${delta.symbol} → Signal: ${signal.action} ${signal.side} qty=${signal.quantity.toFixed(4)} (${signal.leverage}x ${signal.marginType})`);
 
     if (signal.action === 'EXIT') {
-      await this.handleExit(signal, delta);
+      await this.handleExit(signal, delta, opts.dryRun);
     } else if (signal.action === 'ENTER') {
-      await this.handleEnter(signal, delta);
+      await this.handleEnter(signal, delta, opts.dryRun);
     } else if (signal.action === 'MODIFY') {
       if (delta.type === 'SIDE_FLIPPED') {
-        await this.handleSideFlip(signal, delta);
+        await this.handleSideFlip(signal, delta, opts.dryRun);
       } else if (delta.type === 'LEVERAGE_CHANGED') {
-        await this.handleLeverageChange(signal, delta);
+        await this.handleLeverageChange(signal);
       }
     }
   }
 
-  private async handleEnter(signal: TradeSignal, delta: PositionDelta): Promise<void> {
-    const opts = this.mergeOptions();
+  private async handleEnter(signal: TradeSignal, delta: PositionDelta, dryRun: boolean): Promise<void> {
     if (!delta.current) return;
 
     const currentPrice = await this.binance.getMarkPrice(signal.symbol);
@@ -182,25 +185,12 @@ export class MirrorEngine extends EventEmitter {
       return;
     }
 
-    const allocation = this.capitalManager.allocateForSinglePosition(
-      delta.current,
-      opts.totalMargin,
-    );
-    signal.capitalAllocation = allocation;
-
-    if (allocation.adjustedQuantity <= 0) {
-      logWarn(`[Mirror] Quantity too small after allocation: ${allocation.adjustedQuantity}`);
+    if (signal.quantity <= 0) {
+      logWarn(`[Mirror] Quantity too small after ratio: ${signal.quantity}`);
       return;
     }
 
-    signal.quantity = allocation.adjustedQuantity;
-
-    const risk = this.riskManager.assessRisk(signal, allocation.notionalValue);
-    for (const w of risk.warnings) {
-      logWarn(`[Mirror] Risk warning: ${w}`);
-    }
-
-    const result = await this.executor.executeSignal(signal, opts.dryRun);
+    const result = await this.executor.executeSignal(signal, dryRun);
 
     if (result.success) {
       this.orderHistory.addProcessedOrder({
@@ -212,9 +202,9 @@ export class MirrorEngine extends EventEmitter {
         hlFillTime: delta.timestamp,
         timestamp: Date.now(),
       });
-      logInfo(`[Mirror] Entry executed: ${result.orderId}`);
+      logInfo(`[Mirror] Entry executed: ${result.orderId ?? 'ok'} qty=${signal.quantity.toFixed(4)} ${signal.symbol}`);
 
-      if (delta.current.liquidationPrice && !opts.dryRun) {
+      if (delta.current.liquidationPrice && !dryRun) {
         const side = delta.current.side === 'LONG' ? 'BUY' : 'SELL';
         await this.executor.placeStopOrders(
           signal.symbol,
@@ -229,9 +219,8 @@ export class MirrorEngine extends EventEmitter {
     }
   }
 
-  private async handleExit(signal: TradeSignal, delta: PositionDelta): Promise<void> {
-    const opts = this.mergeOptions();
-    const result = await this.executor.closePosition(signal.symbol, opts.dryRun);
+  private async handleExit(signal: TradeSignal, delta: PositionDelta, dryRun: boolean): Promise<void> {
+    const result = await this.executor.closePosition(signal.symbol, dryRun);
 
     if (result.success) {
       this.orderHistory.addProcessedOrder({
@@ -248,43 +237,44 @@ export class MirrorEngine extends EventEmitter {
     }
   }
 
-  private async handleSideFlip(signal: TradeSignal, delta: PositionDelta): Promise<void> {
+  private async handleSideFlip(signal: TradeSignal, delta: PositionDelta, dryRun: boolean): Promise<void> {
     logInfo(`[Mirror] Handling side flip: closing then reopening ${signal.symbol}`);
 
-    const closeResult = await this.executor.closePosition(signal.symbol);
+    const closeResult = await this.executor.closePosition(signal.symbol, dryRun);
     if (!closeResult.success && closeResult.error !== 'no_position') {
       logError(`[Mirror] Failed to close position for flip: ${closeResult.error}`);
       return;
     }
 
-    const currentPrice = await this.binance.getMarkPrice(signal.symbol);
-    if (delta.current) {
-      const priceCheck = this.riskManager.checkPriceTolerance(
-        delta.current.entryPrice,
-        parseFloat(currentPrice),
-        signal.symbol,
-      );
-      if (!priceCheck.shouldExecute) {
-        logWarn(`[Mirror] Price tolerance exceeded for side flip on ${signal.symbol}`);
-        return;
-      }
+    if (!delta.current) return;
 
-      const allocation = this.capitalManager.allocateForSinglePosition(delta.current);
-      signal.quantity = allocation.adjustedQuantity;
-      signal.capitalAllocation = allocation;
-      signal.priceTolerance = priceCheck;
+    const currentPrice = await this.binance.getMarkPrice(signal.symbol);
+    const priceCheck = this.riskManager.checkPriceTolerance(
+      delta.current.entryPrice,
+      parseFloat(currentPrice),
+      signal.symbol,
+    );
+    if (!priceCheck.shouldExecute) {
+      logWarn(`[Mirror] Price tolerance exceeded for side flip on ${signal.symbol}`);
+      return;
+    }
+    signal.priceTolerance = priceCheck;
+
+    if (signal.quantity <= 0) {
+      logWarn(`[Mirror] Quantity too small for side flip: ${signal.quantity}`);
+      return;
     }
 
-    const result = await this.executor.executeSignal(signal);
+    const result = await this.executor.executeSignal(signal, dryRun);
     if (result.success) {
-      logInfo(`[Mirror] Side flip executed: ${result.orderId}`);
+      logInfo(`[Mirror] Side flip executed: ${result.orderId ?? 'ok'}`);
     } else {
       logError(`[Mirror] Side flip entry failed: ${result.error}`);
     }
   }
 
-  private async handleLeverageChange(signal: TradeSignal, delta: PositionDelta): Promise<void> {
-    logInfo(`[Mirror] Leverage change detected for ${signal.symbol}: ${signal.leverage}x ${signal.marginType}`);
+  private async handleLeverageChange(signal: TradeSignal): Promise<void> {
+    logInfo(`[Mirror] Leverage change: ${signal.symbol} → ${signal.leverage}x ${signal.marginType}`);
     try {
       await this.binance.setLeverage(signal.symbol, signal.leverage);
       await this.binance.setMarginType(signal.symbol, signal.marginType);
@@ -294,13 +284,12 @@ export class MirrorEngine extends EventEmitter {
     }
   }
 
-  private mergeOptions(options?: FollowOptions): Required<FollowOptions> {
+  private mergeOptions(): Required<FollowOptions> {
     return {
-      totalMargin: options?.totalMargin ?? this.config.trading.totalMarginUsdt,
-      marginType: options?.marginType ?? this.config.trading.marginType,
-      priceTolerance: options?.priceTolerance ?? this.config.trading.priceTolerancePercent,
-      maxPositionSize: options?.maxPositionSize ?? this.config.trading.maxPositionSizeUsdt,
-      dryRun: options?.dryRun ?? false,
+      ratio: this.config.trading.fixedRatio,
+      marginType: this.config.trading.marginType,
+      priceTolerance: this.config.trading.priceTolerancePercent,
+      dryRun: false,
     };
   }
 }

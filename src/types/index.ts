@@ -91,7 +91,7 @@ export interface TradeSignal {
   reason: string;
   sourceDelta: PositionDelta;
   priceTolerance?: PriceToleranceCheck;
-  capitalAllocation?: CapitalAllocation;
+  ratio: number;
 }
 
 export interface PriceToleranceCheck {
@@ -100,15 +100,6 @@ export interface PriceToleranceCheck {
   priceDifference: number;
   tolerance: number;
   shouldExecute: boolean;
-}
-
-export interface CapitalAllocation {
-  totalMargin: number;
-  allocatedMargin: number;
-  allocationRatio: number;
-  notionalValue: number;
-  adjustedQuantity: number;
-  leverage: number;
 }
 
 export interface ExecutionResult {
@@ -164,11 +155,8 @@ export interface AppConfig {
     testnet: boolean;
   };
   trading: {
-    maxPositionSizeUsdt: number;
-    defaultLeverage: number;
-    riskPercentage: number;
+    fixedRatio: number;
     priceTolerancePercent: number;
-    totalMarginUsdt: number;
     marginType: 'ISOLATED' | 'CROSSED';
   };
   logging: {
@@ -177,10 +165,9 @@ export interface AppConfig {
 }
 
 export interface FollowOptions {
-  totalMargin?: number;
+  ratio?: number;
   marginType?: 'ISOLATED' | 'CROSSED';
   priceTolerance?: number;
-  maxPositionSize?: number;
   dryRun?: boolean;
 }
 
@@ -220,6 +207,7 @@ export const SYMBOL_MAP: Record<string, string> = {
   ENA: 'ENAUSDT',
   EIGEN: 'EIGENUSDT',
   TRUMP: 'TRUMPUSDT',
+  HYPE: 'HYPEUSDT',
 };
 
 export function hlCoinToBinanceSymbol(coin: string): string {

@@ -17,10 +17,9 @@ program
   .command('follow')
   .description('Start mirroring positions from Hyperliquid to Binance')
   .option('-a, --address <address>', 'Hyperliquid address to follow (overrides env)')
-  .option('-m, --total-margin <usdt>', 'Total margin in USDT', parseFloat)
+  .option('-r, --ratio <number>', 'Position ratio vs HL (1.0=equal, 0.1=10%)', parseFloat)
   .option('--margin-type <type>', 'Margin type: ISOLATED or CROSSED', 'CROSSED')
   .option('-p, --price-tolerance <percent>', 'Max price deviation % to still execute', parseFloat)
-  .option('--max-position-size <usdt>', 'Max position size in USDT', parseFloat)
   .option('--dry-run', 'Simulate without executing trades', false)
   .option('-l, --log-level <level>', 'Log level: ERROR|WARN|INFO|DEBUG|VERBOSE', 'INFO')
   .action(async (options) => {
@@ -54,10 +53,9 @@ program
 
     try {
       await engine.start({
-        totalMargin: options.totalMargin,
+        ratio: options.ratio,
         marginType: options.marginType,
         priceTolerance: options.priceTolerance,
-        maxPositionSize: options.maxPositionSize,
         dryRun: options.dryRun,
       });
       console.log('Mirror engine running. Press Ctrl+C to stop.');
@@ -114,7 +112,7 @@ program
     setLogLevel(options.logLevel);
     const config = buildConfigFromEnv();
     const { HyperliquidClient } = await import('./services/hyperliquid-client');
-    const { hlCoinToBinanceSymbol, parseHlPosition } = await import('./types');
+    const { parseHlPosition } = await import('./types');
 
     const hlClient = new HyperliquidClient(config.hyperliquid.apiUrl);
     try {

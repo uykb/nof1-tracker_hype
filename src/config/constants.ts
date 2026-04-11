@@ -17,11 +17,9 @@ export const BINANCE_CONFIG = {
 };
 
 export const TRADING_CONFIG = {
+  DEFAULT_FIXED_RATIO: 1.0,
   DEFAULT_PRICE_TOLERANCE_PERCENT: 1.0,
-  DEFAULT_TOTAL_MARGIN_USDT: 100,
-  DEFAULT_LEVERAGE: 10,
-  MAX_LEVERAGE: 125,
-  TIME_SYNC_TOLERANCE_MS: 5000,
+  DEFAULT_MARGIN_TYPE: 'CROSSED' as const,
   VERIFICATION_DELAY_MS: 2000,
   BETWEEN_OPERATIONS_DELAY_MS: 1000,
 };
@@ -48,12 +46,9 @@ export function buildConfigFromEnv(): AppConfig {
       testnet: binanceTestnet,
     },
     trading: {
-      maxPositionSizeUsdt: parseFloat(process.env.MAX_POSITION_SIZE || '1000'),
-      defaultLeverage: parseInt(process.env.DEFAULT_LEVERAGE || '10', 10),
-      riskPercentage: parseFloat(process.env.RISK_PERCENTAGE || '2.0'),
+      fixedRatio: parseFloat(process.env.FIXED_RATIO || '1.0'),
       priceTolerancePercent: parseFloat(process.env.PRICE_TOLERANCE_PERCENT || '1.0'),
-      totalMarginUsdt: parseFloat(process.env.TOTAL_MARGIN_USDT || '100'),
-      marginType: (process.env.MARGIN_TYPE as 'ISOLATED' | 'CROSSED') || 'CROSSED',
+      marginType: (process.env.MARGIN_TYPE as 'ISOLATED' | 'CROSSED') || TRADING_CONFIG.DEFAULT_MARGIN_TYPE,
     },
     logging: {
       level: process.env.LOG_LEVEL || 'INFO',
