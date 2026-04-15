@@ -52,25 +52,54 @@ export class MirrorEngine extends EventEmitter {
 
     this.isRunning = true;
 
-    await this.binance.syncServerTime();
-    await this.binance.getAccountInfo();
-    logInfo('[Mirror] Binance connection verified');
+    try {
+      logInfo('[Mirror] Step 1/5: Syncing Binance server time...');
+      await this.binance.syncServerTime();
+      logInfo('[Mirror] Step 1/5: Binance server time synced OK');
+    } catch (error: any) {
+      logError(`[Mirror] Step 1/5 FAILED: Binance server time sync error: ${error.message}`);
+      throw error;
+    }
 
-    await this.orderHistory.load();
-    await this.tracker.initialize(this.config.hyperliquid.targetAddress);
-    logInfo('[Mirror] Position tracker initialized');
+    try {
+      logInfo('[Mirror] Step 2/5: Verifying Binance account...');
+      const account = await this.binance.getAccountInfo();
+      logInfo(`[Mirror] Step 2/5: Binance account OK, available balance: ${account.availableBalance} USDT`);
+    } catch (error: any) {
+      logError(`[Mirror] Step 2/5 FAILED: Binance account verification error: ${error.message}`);
+      throw error;
+    }
+
+    try {
+      logInfo('[Mirror] Step 3/5: Loading order history...');
+      await this.orderHistory.load();
+      logInfo('[Mirror] Step 3/5: Order history loaded OK');
+    } catch (error: any) {
+      logError(`[Mirror] Step 3/5 FAILED: Order history load error: ${error.message}`);
+      throw error;
+    }
+
+    try {
+      logInfo('[Mirror] Step 4/5: Initializing position tracker...');
+      await this.tracker.initialize(this.config.hyperliquid.targetAddress);
+      logInfo('[Mirror] Step 4/5: Position tracker initialized OK');
+    } catch (error: any) {
+      logError(`[Mirror] Step 4/5 FAILED: Position tracker init error: ${error.message}`);
+      throw error;
+    }
 
     this.setupWsListeners();
     try {
+      logInfo('[Mirror] Step 5/5: Connecting WebSocket...');
       await this.hlWs.connect();
       this.hlWs.subscribeToFills();
-      logInfo('[Mirror] WebSocket connected and subscribed');
-    } catch (error) {
-      logWarn(`[Mirror] WebSocket connection failed, falling back to polling only: ${(error as Error).message}`);
+      logInfo('[Mirror] Step 5/5: WebSocket connected and subscribed OK');
+    } catch (error: any) {
+      logWarn(`[Mirror] Step 5/5 WARNING: WebSocket connection failed, falling back to polling only: ${error.message}`);
     }
 
     this.startPolling();
-    logInfo('[Mirror] Polling started');
+    logInfo('[Mirror] All steps completed. Polling started.');
     this.emit('started');
   }
 
@@ -130,20 +159,39 @@ export class MirrorEngine extends EventEmitter {
   private async pollAndProcess(): Promise<void> {
     if (!this.tracker.isReady()) return;
 
-    const deltas = await this.tracker.detectChanges(this.config.hyperliquid.targetAddress);
+    let deltas: PositionDelta[];
+    try {
+      deltas = await this.tracker.detectChanges(this.config.hyperliquid.targetAddress);
+    } catch (error: any) {
+      logError(`[Mirror] detectChanges FAILED: ${error.message}`);
+      return;
+    }
 
     if (deltas.length === 0) {
       logDebug('[Mirror] No position changes detected');
       return;
     }
 
-    await this.executor.cleanOrphanedOrders();
-
-    for (const delta of deltas) {
-      await this.processDelta(delta);
+    try {
+      const count = await this.executor.cleanOrphanedOrders();
+      if (count > 0) logInfo(`[Mirror] Cleaned ${count} orphaned order(s)`);
+    } catch (error: any) {
+      logWarn(`[Mirror] cleanOrphanedOrders FAILED (non-fatal): ${error.message}`);
     }
 
-    await this.orderHistory.save();
+    for (const delta of deltas) {
+      try {
+        await this.processDelta(delta);
+      } catch (error: any) {
+        logError(`[Mirror] processDelta FAILED for ${delta.type} ${delta.symbol}: ${error.message}`);
+      }
+    }
+
+    try {
+      await this.orderHistory.save();
+    } catch (error: any) {
+      logError(`[Mirror] orderHistory.save FAILED: ${error.message}`);
+    }
   }
 
   private async processDelta(delta: PositionDelta): Promise<void> {
@@ -172,25 +220,42 @@ export class MirrorEngine extends EventEmitter {
   private async handleEnter(signal: TradeSignal, delta: PositionDelta, dryRun: boolean): Promise<void> {
     if (!delta.current) return;
 
-    const currentPrice = await this.binance.getMarkPrice(signal.symbol);
+    logInfo(`[Mirror] handleEnter START: ${signal.symbol} ${signal.side} qty=${signal.quantity.toFixed(4)}`);
+
+    // Step 1: Get mark price for tolerance check
+    let currentPrice: string;
+    try {
+      logDebug(`[Mirror]   Step 1: getMarkPrice(${signal.symbol})...`);
+      currentPrice = await this.binance.getMarkPrice(signal.symbol);
+      logDebug(`[Mirror]   Step 1: getMarkPrice OK, price=${currentPrice}`);
+    } catch (error: any) {
+      logError(`[Mirror]   Step 1 FAILED: getMarkPrice(${signal.symbol}) error: ${error.message}`);
+      return;
+    }
+
+    // Step 2: Price tolerance check
     const priceCheck = this.riskManager.checkPriceTolerance(
       delta.current.entryPrice,
       parseFloat(currentPrice),
       signal.symbol,
     );
     signal.priceTolerance = priceCheck;
+    logDebug(`[Mirror]   Step 2: price tolerance check: diff=${priceCheck.priceDifference.toFixed(2)}%, tol=${priceCheck.tolerance}%, pass=${priceCheck.shouldExecute}`);
 
     if (!priceCheck.shouldExecute) {
-      logWarn(`[Mirror] Price tolerance exceeded for ${signal.symbol}: ${priceCheck.priceDifference.toFixed(2)}% > ${priceCheck.tolerance}%`);
+      logWarn(`[Mirror]   Step 2 SKIP: price tolerance exceeded for ${signal.symbol}: ${priceCheck.priceDifference.toFixed(2)}% > ${priceCheck.tolerance}%`);
       return;
     }
 
     if (signal.quantity <= 0) {
-      logWarn(`[Mirror] Quantity too small after ratio: ${signal.quantity}`);
+      logWarn(`[Mirror]   SKIP: quantity too small after ratio: ${signal.quantity}`);
       return;
     }
 
+    // Step 3: Execute trade
+    logInfo(`[Mirror]   Step 3: executeSignal(${signal.symbol} ${signal.side} ${signal.quantity.toFixed(4)} @ market ${signal.leverage}x ${signal.marginType})...`);
     const result = await this.executor.executeSignal(signal, dryRun);
+    logInfo(`[Mirror]   Step 3: executeSignal result: success=${result.success}, orderId=${result.orderId ?? 'N/A'}, error=${result.error ?? 'none'}`);
 
     if (result.success) {
       this.orderHistory.addProcessedOrder({
@@ -202,25 +267,38 @@ export class MirrorEngine extends EventEmitter {
         hlFillTime: delta.timestamp,
         timestamp: Date.now(),
       });
-      logInfo(`[Mirror] Entry executed: ${result.orderId ?? 'ok'} qty=${signal.quantity.toFixed(4)} ${signal.symbol}`);
+      logInfo(`[Mirror] Enter OK: orderId=${result.orderId ?? 'N/A'} qty=${signal.quantity.toFixed(4)} ${signal.symbol} price=${result.price ?? 'market'}`);
 
+      // Step 4: Place stop orders (optional)
       if (delta.current.liquidationPrice && !dryRun) {
         const side = delta.current.side === 'LONG' ? 'BUY' : 'SELL';
-        await this.executor.placeStopOrders(
-          signal.symbol,
-          side,
-          signal.quantity,
-          undefined,
-          delta.current.liquidationPrice,
-        );
+        logInfo(`[Mirror]   Step 4: placing stop orders (SL=${delta.current.liquidationPrice})...`);
+        try {
+          await this.executor.placeStopOrders(
+            signal.symbol,
+            side,
+            signal.quantity,
+            undefined,
+            delta.current.liquidationPrice,
+          );
+          logInfo(`[Mirror]   Step 4: stop orders placed`);
+        } catch (error: any) {
+          logWarn(`[Mirror]   Step 4 FAILED: stop orders error: ${error.message}`);
+        }
+      } else {
+        logDebug(`[Mirror]   Step 4: skip stop orders (no liquidation price or dry-run)`);
       }
     } else {
-      logError(`[Mirror] Entry failed: ${result.error}`);
+      logError(`[Mirror] Enter FAILED: ${result.error}`);
     }
   }
 
   private async handleExit(signal: TradeSignal, delta: PositionDelta, dryRun: boolean): Promise<void> {
+    logInfo(`[Mirror] handleExit START: ${signal.symbol}`);
+
+    logDebug(`[Mirror]   Step 1: closePosition(${signal.symbol})...`);
     const result = await this.executor.closePosition(signal.symbol, dryRun);
+    logInfo(`[Mirror]   Step 1: closePosition result: success=${result.success}, orderId=${result.orderId ?? 'N/A'}, error=${result.error ?? 'none'}`);
 
     if (result.success) {
       this.orderHistory.addProcessedOrder({
@@ -231,56 +309,80 @@ export class MirrorEngine extends EventEmitter {
         timestamp: Date.now(),
         hlFillTime: delta.timestamp,
       });
-      logInfo(`[Mirror] Exit executed: ${result.orderId ?? 'ok'}`);
+      logInfo(`[Mirror] Exit OK: orderId=${result.orderId ?? 'N/A'}`);
     } else {
-      logError(`[Mirror] Exit failed: ${result.error}`);
+      logError(`[Mirror] Exit FAILED: ${result.error}`);
     }
   }
 
   private async handleSideFlip(signal: TradeSignal, delta: PositionDelta, dryRun: boolean): Promise<void> {
-    logInfo(`[Mirror] Handling side flip: closing then reopening ${signal.symbol}`);
+    logInfo(`[Mirror] handleSideFlip START: ${signal.symbol} closing then reopening`);
 
+    // Step 1: Close old position
+    logDebug(`[Mirror]   Step 1: closePosition(${signal.symbol}) for flip...`);
     const closeResult = await this.executor.closePosition(signal.symbol, dryRun);
+    logInfo(`[Mirror]   Step 1: close result: success=${closeResult.success}, error=${closeResult.error ?? 'none'}`);
     if (!closeResult.success && closeResult.error !== 'no_position') {
-      logError(`[Mirror] Failed to close position for flip: ${closeResult.error}`);
+      logError(`[Mirror]   Step 1 FAILED: cannot close for flip: ${closeResult.error}`);
       return;
     }
 
     if (!delta.current) return;
 
-    const currentPrice = await this.binance.getMarkPrice(signal.symbol);
+    // Step 2: Get mark price for tolerance check
+    let currentPrice: string;
+    try {
+      logDebug(`[Mirror]   Step 2: getMarkPrice(${signal.symbol}) for flip...`);
+      currentPrice = await this.binance.getMarkPrice(signal.symbol);
+      logDebug(`[Mirror]   Step 2: getMarkPrice OK, price=${currentPrice}`);
+    } catch (error: any) {
+      logError(`[Mirror]   Step 2 FAILED: getMarkPrice(${signal.symbol}) for flip: ${error.message}`);
+      return;
+    }
+
     const priceCheck = this.riskManager.checkPriceTolerance(
       delta.current.entryPrice,
       parseFloat(currentPrice),
       signal.symbol,
     );
     if (!priceCheck.shouldExecute) {
-      logWarn(`[Mirror] Price tolerance exceeded for side flip on ${signal.symbol}`);
+      logWarn(`[Mirror]   Step 2 SKIP: price tolerance exceeded for side flip on ${signal.symbol}`);
       return;
     }
     signal.priceTolerance = priceCheck;
 
     if (signal.quantity <= 0) {
-      logWarn(`[Mirror] Quantity too small for side flip: ${signal.quantity}`);
+      logWarn(`[Mirror]   SKIP: quantity too small for side flip: ${signal.quantity}`);
       return;
     }
 
+    // Step 3: Open new position
+    logInfo(`[Mirror]   Step 3: executeSignal for side flip (${signal.symbol} ${signal.side} ${signal.quantity.toFixed(4)})...`);
     const result = await this.executor.executeSignal(signal, dryRun);
     if (result.success) {
-      logInfo(`[Mirror] Side flip executed: ${result.orderId ?? 'ok'}`);
+      logInfo(`[Mirror] Side flip OK: orderId=${result.orderId ?? 'N/A'}`);
     } else {
-      logError(`[Mirror] Side flip entry failed: ${result.error}`);
+      logError(`[Mirror] Side flip entry FAILED: ${result.error}`);
     }
   }
 
   private async handleLeverageChange(signal: TradeSignal): Promise<void> {
-    logInfo(`[Mirror] Leverage change: ${signal.symbol} → ${signal.leverage}x ${signal.marginType}`);
+    logInfo(`[Mirror] handleLeverageChange START: ${signal.symbol} → ${signal.leverage}x ${signal.marginType}`);
+
     try {
+      logDebug(`[Mirror]   Step 1: setLeverage(${signal.symbol}, ${signal.leverage})...`);
       await this.binance.setLeverage(signal.symbol, signal.leverage);
-      await this.binance.setMarginType(signal.symbol, signal.marginType);
-      logInfo(`[Mirror] Updated ${signal.symbol} to ${signal.leverage}x ${signal.marginType}`);
+      logInfo(`[Mirror]   Step 1: setLeverage OK`);
     } catch (error: any) {
-      logWarn(`[Mirror] Failed to update leverage/margin: ${error.message}`);
+      logWarn(`[Mirror]   Step 1 FAILED: setLeverage: ${error.message}`);
+    }
+
+    try {
+      logDebug(`[Mirror]   Step 2: setMarginType(${signal.symbol}, ${signal.marginType})...`);
+      await this.binance.setMarginType(signal.symbol, signal.marginType);
+      logInfo(`[Mirror]   Step 2: setMarginType OK`);
+    } catch (error: any) {
+      logWarn(`[Mirror]   Step 2 FAILED: setMarginType: ${error.message}`);
     }
   }
 

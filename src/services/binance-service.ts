@@ -1,6 +1,6 @@
 import axios, { AxiosInstance } from 'axios';
 import crypto from 'crypto-js';
-import { BINANCE_CONFIG, TRADING_CONFIG } from '../config/constants';
+import { BINANCE_CONFIG } from '../config/constants';
 import { logInfo, logDebug, logWarn, logError } from '../utils/logger';
 
 export interface BinanceOrder {
@@ -61,6 +61,7 @@ export class BinanceService {
     this.apiKey = apiKey;
     this.apiSecret = apiSecret;
     this.baseUrl = testnet ? BINANCE_CONFIG.TESTNET_BASE_URL : BINANCE_CONFIG.MAINNET_BASE_URL;
+    logInfo(`[Binance] Initializing with baseUrl=${this.baseUrl} (testnet=${testnet})`);
     this.client = axios.create({
       baseURL: this.baseUrl,
       timeout: 15000,
@@ -70,12 +71,14 @@ export class BinanceService {
 
   async syncServerTime(): Promise<void> {
     try {
+      logDebug('[Binance] GET /fapi/v1/time...');
       const response = await this.client.get('/fapi/v1/time');
       const serverTime = response.data.serverTime as number;
       this.serverTimeOffset = serverTime - Date.now();
-      logDebug(`[Binance] Server time offset: ${this.serverTimeOffset}ms`);
-    } catch (error) {
-      logWarn('[Binance] Failed to sync server time');
+      logInfo(`[Binance] Server time synced, offset=${this.serverTimeOffset}ms`);
+    } catch (error: any) {
+      logError(`[Binance] syncServerTime FAILED: ${error.message}`);
+      throw error;
     }
   }
 
@@ -108,6 +111,8 @@ export class BinanceService {
           .map(([k, v]) => `${k}=${v}`)
           .join('&')}&signature=${signature}`;
 
+        logDebug(`[Binance] ${method} ${url.substring(0, endpoint.length + 80)}... (attempt ${attempt + 1})`);
+
         const config =
           method === 'POST'
             ? { method: 'POST' as const, url }
@@ -116,16 +121,18 @@ export class BinanceService {
               : { method: 'GET' as const, url };
 
         const response = await this.client.request<T>(config);
+        logDebug(`[Binance] ${method} ${endpoint} OK`);
         return response.data;
       } catch (error: any) {
         if (error.response?.data?.code === -1021) {
-          logWarn('[Binance] Timestamp error, resyncing...');
+          logWarn(`[Binance] Timestamp error on ${endpoint}, resyncing... (attempt ${attempt + 1})`);
           await this.syncServerTime();
           if (attempt < maxRetries - 1) continue;
         }
-        const msg = error.response?.data
-          ? JSON.stringify(error.response.data)
-          : error.message;
+        const status = error.response?.status;
+        const data = error.response?.data ? JSON.stringify(error.response.data) : '';
+        const msg = data || error.message;
+        logError(`[Binance] ${method} ${endpoint} FAILED: status=${status} msg=${msg}`);
         throw new Error(`Binance API error: ${msg}`);
       }
     }
@@ -133,7 +140,9 @@ export class BinanceService {
   }
 
   async getAccountInfo(): Promise<AccountInfo> {
+    logDebug('[Binance] getAccountInfo...');
     const data = await this.makeSignedRequest<any>('/fapi/v2/account', 'GET');
+    logInfo(`[Binance] getAccountInfo OK: balance=${data.availableBalance} USDT`);
     return {
       totalWalletBalance: data.totalWalletBalance,
       totalUnrealizedProfit: data.totalUnrealizedProfit,
@@ -142,6 +151,7 @@ export class BinanceService {
   }
 
   async getPositions(): Promise<PositionResponse[]> {
+    logDebug('[Binance] getPositions...');
     const data = await this.makeSignedRequest<any[]>('/fapi/v2/positionRisk', 'GET');
     return data.filter((p) => parseFloat(p.positionAmt) !== 0).map((p) => ({
       symbol: p.symbol,
@@ -171,40 +181,50 @@ export class BinanceService {
     if (order.newClientOrderId) params.newClientOrderId = order.newClientOrderId;
     if (order.workingType) params.workingType = order.workingType;
 
-    logInfo(`[Binance] Placing ${order.side} ${order.type} ${order.quantity} ${order.symbol}`);
+    logInfo(`[Binance] placeOrder: ${order.side} ${order.type} ${order.quantity} ${order.symbol}`);
     return this.makeSignedRequest<OrderResponse>('/fapi/v1/order', 'POST', params);
   }
 
   async setLeverage(symbol: string, leverage: number): Promise<void> {
-    logInfo(`[Binance] Setting leverage for ${symbol} to ${leverage}x`);
-    await this.makeSignedRequest('/fapi/v1/leverage', 'POST', { symbol, leverage });
+    logInfo(`[Binance] setLeverage(${symbol}, ${leverage}x)`);
+    try {
+      await this.makeSignedRequest('/fapi/v1/leverage', 'POST', { symbol, leverage });
+      logInfo(`[Binance] setLeverage OK: ${symbol} ${leverage}x`);
+    } catch (error: any) {
+      logError(`[Binance] setLeverage FAILED: ${symbol} ${leverage}x - ${error.message}`);
+      throw error;
+    }
   }
 
   async setMarginType(symbol: string, marginType: 'ISOLATED' | 'CROSSED'): Promise<void> {
-    logInfo(`[Binance] Setting margin type for ${symbol} to ${marginType}`);
+    logInfo(`[Binance] setMarginType(${symbol}, ${marginType})`);
     try {
       await this.makeSignedRequest('/fapi/v1/marginType', 'POST', { symbol, marginType });
+      logInfo(`[Binance] setMarginType OK: ${symbol} ${marginType}`);
     } catch (error: any) {
       if (error.message?.includes('No need to change margin type')) {
         logDebug(`[Binance] Margin type already ${marginType} for ${symbol}`);
         return;
       }
+      logError(`[Binance] setMarginType FAILED: ${symbol} ${marginType} - ${error.message}`);
       throw error;
     }
   }
 
   async cancelAllOrders(symbol: string): Promise<void> {
-    logInfo(`[Binance] Cancelling all orders for ${symbol}`);
+    logInfo(`[Binance] cancelAllOrders(${symbol})`);
     await this.makeSignedRequest('/fapi/v1/allOpenOrders', 'DELETE', { symbol });
   }
 
   async cancelOrder(symbol: string, orderId: number): Promise<void> {
+    logDebug(`[Binance] cancelOrder(${symbol}, ${orderId})`);
     await this.makeSignedRequest('/fapi/v1/order', 'DELETE', { symbol, orderId });
   }
 
   async getOpenOrders(symbol?: string): Promise<any[]> {
     const params: Record<string, unknown> = {};
     if (symbol) params.symbol = symbol;
+    logDebug(`[Binance] getOpenOrders(${symbol ?? 'all'})`);
     return this.makeSignedRequest<any[]>('/fapi/v1/openOrders', 'GET', params);
   }
 
@@ -212,35 +232,68 @@ export class BinanceService {
     if (this.symbolInfoCache.has(symbol)) {
       return this.symbolInfoCache.get(symbol)!;
     }
-    const response = await this.client.get('/fapi/v1/exchangeInfo');
-    const symInfo = response.data.symbols.find((s: any) => s.symbol === symbol);
-    if (!symInfo) {
-      throw new Error(`Symbol ${symbol} not found on Binance`);
+    logDebug(`[Binance] getSymbolInfo(${symbol})...`);
+    try {
+      const response = await this.client.get('/fapi/v1/exchangeInfo');
+      const symInfo = response.data.symbols.find((s: any) => s.symbol === symbol);
+      if (!symInfo) {
+        logError(`[Binance] getSymbolInfo FAILED: Symbol ${symbol} not found in exchangeInfo`);
+        throw new Error(`Symbol ${symbol} not found on Binance`);
+      }
+      const info = {
+        pricePrecision: symInfo.pricePrecision as number,
+        quantityPrecision: symInfo.quantityPrecision as number,
+      };
+      this.symbolInfoCache.set(symbol, info);
+      logInfo(`[Binance] getSymbolInfo OK: ${symbol} pricePrecision=${info.pricePrecision} qtyPrecision=${info.quantityPrecision}`);
+      return info;
+    } catch (error: any) {
+      logError(`[Binance] getSymbolInfo FAILED: ${symbol} - ${error.message}`);
+      throw error;
     }
-    const info = {
-      pricePrecision: symInfo.pricePrecision as number,
-      quantityPrecision: symInfo.quantityPrecision as number,
-    };
-    this.symbolInfoCache.set(symbol, info);
-    return info;
   }
 
   async get24hrTicker(symbol: string): Promise<{ lastPrice: string; markPrice?: string }> {
-    const response = await this.client.get('/fapi/v1/ticker/24hr', {
-      params: { symbol },
-    });
-    return { lastPrice: response.data.lastPrice };
+    logDebug(`[Binance] get24hrTicker(${symbol})`);
+    try {
+      const response = await this.client.get('/fapi/v1/ticker/24hr', {
+        params: { symbol },
+      });
+      return { lastPrice: response.data.lastPrice };
+    } catch (error: any) {
+      logError(`[Binance] get24hrTicker FAILED: ${symbol} - ${error.message}`);
+      throw error;
+    }
   }
 
   async getMarkPrice(symbol: string): Promise<string> {
-    const response = await this.client.get('/fapi/v1/premiumMarks', {
-      params: { symbol },
-    });
-    if (response.data && response.data.length > 0) {
-      return response.data[0].markPrice;
+    logDebug(`[Binance] getMarkPrice(${symbol})...`);
+    // Try /fapi/v1/premiumIndex first (correct Binance endpoint)
+    try {
+      const response = await this.client.get('/fapi/v1/premiumIndex', {
+        params: { symbol },
+      });
+      if (response.data && response.data.markPrice) {
+        logDebug(`[Binance] getMarkPrice OK via premiumIndex: ${symbol}=${response.data.markPrice}`);
+        return response.data.markPrice;
+      }
+      // premiumIndex returned data but no markPrice field, try array format
+      if (Array.isArray(response.data) && response.data.length > 0 && response.data[0].markPrice) {
+        logDebug(`[Binance] getMarkPrice OK via premiumIndex (array): ${symbol}=${response.data[0].markPrice}`);
+        return response.data[0].markPrice;
+      }
+    } catch (error: any) {
+      logWarn(`[Binance] getMarkPrice: premiumIndex failed for ${symbol}: ${error.message}, falling back to 24hrTicker`);
     }
-    const ticker = await this.get24hrTicker(symbol);
-    return ticker.lastPrice;
+    // Fallback to 24hr ticker
+    try {
+      const ticker = await this.get24hrTicker(symbol);
+      logDebug(`[Binance] getMarkPrice fallback OK via 24hrTicker: ${symbol}=${ticker.lastPrice}`);
+      return ticker.lastPrice;
+    } catch (error: any) {
+      logError(`[Binance] getMarkPrice FAILED completely for ${symbol}: premiumIndex and 24hrTicker both failed`);
+      throw error;
+    }
   }
 
   formatQuantity(quantity: number, symbol: string): string {
