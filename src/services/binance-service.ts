@@ -132,6 +132,11 @@ export class BinanceService {
         const status = error.response?.status;
         const data = error.response?.data ? JSON.stringify(error.response.data) : '';
         const msg = data || error.message;
+        const errorCode = error.response?.data?.code;
+        if (errorCode === -4046) {
+          logDebug(`[Binance] ${method} ${endpoint} skipped (already set): ${msg}`);
+          throw new Error(`Binance API skipped: ${msg}`);
+        }
         logError(`[Binance] ${method} ${endpoint} FAILED: status=${status} msg=${msg}`);
         throw new Error(`Binance API error: ${msg}`);
       }

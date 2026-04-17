@@ -189,8 +189,11 @@ export class TradeExecutor {
     try {
       await this.binance.setMarginType(symbol, marginType);
     } catch (e: any) {
-      if (!e.message?.includes('No need to change margin type')) {
-        logWarn(`[Executor] Margin type warning for ${symbol}: ${e.message}`);
+      const msg = e.message || '';
+      if (msg.includes('No need to change margin type') || msg.includes('skipped')) {
+        logDebug(`[Executor] Margin type already ${marginType} for ${symbol}`);
+      } else {
+        logWarn(`[Executor] Margin type warning for ${symbol}: ${msg}`);
       }
     }
 
