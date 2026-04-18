@@ -50,10 +50,14 @@ export class HyperliquidWs extends EventEmitter {
         this.handleMessage(data.toString());
       });
 
-      this.ws.on('close', (code: number, reason: Buffer) => {
-        const msg = reason.toString() || `Connection closed (code: ${code})`;
+this.ws.on('close', (code: number, reason: Buffer) => {
+      const msg = reason.toString() || `Connection closed (code: ${code})`;
+      if (code === 1000 || msg.toLowerCase().includes('expired')) {
+        logInfo(`[HL-WS] Closed normally: ${msg}`);
+      } else {
         logWarn(`[HL-WS] ${msg}`);
-        this.emit('disconnected', msg);
+      }
+      this.emit('disconnected', msg);
         this.stopPingInterval();
         if (!this.isShuttingDown) {
           this.scheduleReconnect();
@@ -61,7 +65,12 @@ export class HyperliquidWs extends EventEmitter {
       });
 
       this.ws.on('error', (error: Error) => {
-        logError(`[HL-WS] Error: ${error.message}`);
+        const msg = error.message.toLowerCase();
+        if (msg.includes('502') || msg.includes('503') || msg.includes('bad gateway') || msg.includes('unexpected server response')) {
+          logWarn(`[HL-WS] Transient error: ${error.message}`);
+        } else {
+          logError(`[HL-WS] Error: ${error.message}`);
+        }
         this.emit('error', error);
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
           reject(new ConnectionError(`WebSocket connection failed: ${error.message}`, error));
@@ -169,7 +178,7 @@ export class HyperliquidWs extends EventEmitter {
       try {
         await this.connect();
       } catch (error) {
-        logError(`[HL-WS] Reconnect failed: ${(error as Error).message}`);
+        logWarn(`[HL-WS] Reconnect failed (will retry): ${(error as Error).message}`);
       }
     }, delay);
   }

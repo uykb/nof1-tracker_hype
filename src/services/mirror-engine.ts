@@ -10,6 +10,13 @@ import { NotificationManager, createNotifiersFromEnv, NotificationMessage } from
 import { AppConfig, FollowOptions, HlFill, PositionDelta, TradeSignal } from '../types';
 import { logInfo, logDebug, logWarn, logError } from '../utils/logger';
 
+function isTransientError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return lower.includes('502') || lower.includes('503') || lower.includes('bad gateway')
+    || lower.includes('timeout') || lower.includes('econnreset') || lower.includes('econnrefused')
+    || lower.includes('socket hang up') || lower.includes('rate limit');
+}
+
 export class MirrorEngine extends EventEmitter {
   private hlClient: HyperliquidClient;
   private hlWs: HyperliquidWs;
@@ -140,7 +147,12 @@ export class MirrorEngine extends EventEmitter {
       this.tracker.notifyFill(fill);
       this.resetPollInterval();
       this.pollAndProcess().catch((err) => {
-        logError(`[Mirror] WS-triggered poll error: ${(err as Error).message}`);
+        const msg = (err as Error).message;
+        if (isTransientError(msg)) {
+          logWarn(`[Mirror] WS-triggered poll transient error: ${msg}`);
+        } else {
+          logError(`[Mirror] WS-triggered poll error: ${msg}`);
+        }
       });
     });
 
@@ -149,12 +161,21 @@ export class MirrorEngine extends EventEmitter {
     });
 
     this.hlWs.on('disconnected', (reason: string) => {
-      logWarn(`[Mirror] WebSocket disconnected: ${reason}`);
-      this.notifier.notify('WARNING', 'WebSocket Disconnected', `HL WebSocket disconnected: ${reason}`);
+      const lower = reason.toLowerCase();
+      if (lower.includes('expired') || lower.includes('code: 1000')) {
+        logInfo(`[Mirror] WebSocket disconnected (normal): ${reason}`);
+      } else {
+        logWarn(`[Mirror] WebSocket disconnected: ${reason}`);
+        this.notifier.notify('WARNING', 'WebSocket Disconnected', `HL WebSocket disconnected: ${reason}`);
+      }
     });
 
     this.hlWs.on('error', (error: Error) => {
-      logError(`[Mirror] WebSocket error: ${error.message}`);
+      if (isTransientError(error.message)) {
+        logWarn(`[Mirror] WebSocket transient error: ${error.message}`);
+      } else {
+        logError(`[Mirror] WebSocket error: ${error.message}`);
+      }
       this.notifier.notify('ERROR', 'WebSocket Error', error.message);
     });
   }
@@ -170,7 +191,12 @@ export class MirrorEngine extends EventEmitter {
       try {
         await this.pollAndProcess();
       } catch (error) {
-        logError(`[Mirror] Poll error: ${(error as Error).message}`);
+        const msg = (error as Error).message;
+        if (isTransientError(msg)) {
+          logWarn(`[Mirror] Poll transient error: ${msg}`);
+        } else {
+          logError(`[Mirror] Poll error: ${msg}`);
+        }
       }
       if (this.isRunning) {
         const nextDelay = this.getNextPollDelay();
@@ -209,7 +235,12 @@ export class MirrorEngine extends EventEmitter {
       try {
         deltas = await this.tracker.detectChanges(this.config.hyperliquid.targetAddress);
       } catch (error: any) {
-        logError(`[Mirror] detectChanges FAILED: ${error.message}`);
+        const msg = (error as Error).message || '';
+        if (isTransientError(msg)) {
+          logWarn(`[Mirror] detectChanges transient error (will retry): ${msg}`);
+        } else {
+          logError(`[Mirror] detectChanges FAILED: ${msg}`);
+        }
         return;
       }
 

@@ -46,6 +46,12 @@ export class DiscordNotifier implements Notifier {
 
 export class NotificationManager {
   private notifiers: Notifier[] = [];
+  private lastNotified: Map<string, number> = new Map();
+  private throttleMs: number;
+
+  constructor(throttleMs: number = 60000) {
+    this.throttleMs = throttleMs;
+  }
 
   addNotifier(notifier: Notifier): void {
     this.notifiers.push(notifier);
@@ -53,11 +59,20 @@ export class NotificationManager {
   }
 
   async notify(type: NotificationMessage['type'], title: string, body: string): Promise<void> {
+    const key = `${type}:${title}`;
+    const now = Date.now();
+    const lastTime = this.lastNotified.get(key);
+    if (lastTime && now - lastTime < this.throttleMs) {
+      logDebug(`[Notify] Throttled: ${title} (last sent ${Math.round((now - lastTime) / 1000)}s ago)`);
+      return;
+    }
+    this.lastNotified.set(key, now);
+
     const message: NotificationMessage = {
       type,
       title,
       body,
-      timestamp: Date.now(),
+      timestamp: now,
     };
     for (const notifier of this.notifiers) {
       await notifier.send(message).catch((err) => {
