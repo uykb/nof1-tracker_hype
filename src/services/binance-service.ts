@@ -2,6 +2,7 @@ import axios, { AxiosInstance } from 'axios';
 import crypto from 'crypto-js';
 import { BINANCE_CONFIG } from '../config/constants';
 import { logInfo, logDebug, logWarn, logError } from '../utils/logger';
+import { sleep } from '../utils/sleep';
 
 export interface BinanceOrder {
   symbol: string;
@@ -49,13 +50,47 @@ export interface AccountInfo {
   availableBalance: string;
 }
 
+export interface BinanceAccountRaw {
+  totalWalletBalance: string;
+  totalUnrealizedProfit: string;
+  availableBalance: string;
+}
+
+export interface BinancePositionRaw {
+  symbol: string;
+  positionAmt: string;
+  entryPrice: string;
+  unrealizedProfit: string;
+  liquidationPrice: string | null;
+  leverage: string;
+  marginType: string;
+  positionSide: string;
+}
+
+export interface BinanceOpenOrderRaw {
+  orderId: number;
+  symbol: string;
+  type: string;
+  side: string;
+  price: string;
+  origQty: string;
+  status: string;
+}
+
+export interface SymbolFilters {
+  minQty: string;
+  maxQty: string;
+  stepSize: string;
+  minNotional: string;
+}
+
 export class BinanceService {
   private apiKey: string;
   private apiSecret: string;
   private baseUrl: string;
   private client: AxiosInstance;
   private serverTimeOffset = 0;
-  private symbolInfoCache: Map<string, { pricePrecision: number; quantityPrecision: number }> = new Map();
+  private symbolInfoCache: Map<string, { pricePrecision: number; quantityPrecision: number; filters: SymbolFilters }> = new Map();
 
   constructor(apiKey: string, apiSecret: string, testnet: boolean = false) {
     this.apiKey = apiKey;
@@ -102,8 +137,10 @@ export class BinanceService {
     const timestamp = this.getAdjustedTimestamp();
     const allParams = { ...params, timestamp };
 
-    const maxRetries = 3;
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const maxAttempts = 3;
+    let lastError: Error | undefined;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         const signature = this.createSignature(allParams);
         const url = `${endpoint}?${Object.entries(allParams)
@@ -124,29 +161,49 @@ export class BinanceService {
         logDebug(`[Binance] ${method} ${endpoint} OK`);
         return response.data;
       } catch (error: any) {
-        if (error.response?.data?.code === -1021) {
-          logWarn(`[Binance] Timestamp error on ${endpoint}, resyncing... (attempt ${attempt + 1})`);
-          await this.syncServerTime();
-          if (attempt < maxRetries - 1) continue;
-        }
         const status = error.response?.status;
         const data = error.response?.data ? JSON.stringify(error.response.data) : '';
         const msg = data || error.message;
         const errorCode = error.response?.data?.code;
+
+        if (errorCode === -1021 && attempt < maxAttempts - 1) {
+          logWarn(`[Binance] Timestamp error on ${endpoint}, resyncing... (attempt ${attempt + 1})`);
+          await this.syncServerTime();
+          lastError = new Error(msg);
+          continue;
+        }
+
+        if (status === 429 && attempt < maxAttempts - 1) {
+          const retryAfter = parseInt(error.response?.headers?.['retry-after'] || '2', 10);
+          logWarn(`[Binance] Rate limited on ${endpoint}, retrying after ${retryAfter}s...`);
+          await sleep(retryAfter * 1000);
+          lastError = new Error(msg);
+          continue;
+        }
+
+        if (status && status >= 500 && attempt < maxAttempts - 1) {
+          const delay = 1000 * Math.pow(2, attempt);
+          logWarn(`[Binance] Server error ${status} on ${endpoint}, retrying in ${delay}ms...`);
+          await sleep(delay);
+          lastError = new Error(msg);
+          continue;
+        }
+
         if (errorCode === -4046) {
           logDebug(`[Binance] ${method} ${endpoint} skipped (already set): ${msg}`);
           throw new Error(`Binance API skipped: ${msg}`);
         }
+
         logError(`[Binance] ${method} ${endpoint} FAILED: status=${status} msg=${msg}`);
         throw new Error(`Binance API error: ${msg}`);
       }
     }
-    throw new Error('Binance API: max retries exceeded');
+    throw lastError ?? new Error('Binance API: max retries exceeded');
   }
 
   async getAccountInfo(): Promise<AccountInfo> {
     logDebug('[Binance] getAccountInfo...');
-    const data = await this.makeSignedRequest<any>('/fapi/v2/account', 'GET');
+    const data = await this.makeSignedRequest<BinanceAccountRaw>('/fapi/v2/account', 'GET');
     logInfo(`[Binance] getAccountInfo OK: balance=${data.availableBalance} USDT`);
     return {
       totalWalletBalance: data.totalWalletBalance,
@@ -157,7 +214,7 @@ export class BinanceService {
 
   async getPositions(): Promise<PositionResponse[]> {
     logDebug('[Binance] getPositions...');
-    const data = await this.makeSignedRequest<any[]>('/fapi/v2/positionRisk', 'GET');
+    const data = await this.makeSignedRequest<BinancePositionRaw[]>('/fapi/v2/positionRisk', 'GET');
     return data.filter((p) => parseFloat(p.positionAmt) !== 0).map((p) => ({
       symbol: p.symbol,
       positionAmt: p.positionAmt,
@@ -226,31 +283,78 @@ export class BinanceService {
     await this.makeSignedRequest('/fapi/v1/order', 'DELETE', { symbol, orderId });
   }
 
-  async getOpenOrders(symbol?: string): Promise<any[]> {
+  async getOpenOrders(symbol?: string): Promise<BinanceOpenOrderRaw[]> {
     const params: Record<string, unknown> = {};
     if (symbol) params.symbol = symbol;
     logDebug(`[Binance] getOpenOrders(${symbol ?? 'all'})`);
-    return this.makeSignedRequest<any[]>('/fapi/v1/openOrders', 'GET', params);
+    return this.makeSignedRequest<BinanceOpenOrderRaw[]>('/fapi/v1/openOrders', 'GET', params);
   }
 
-  async getSymbolInfo(symbol: string): Promise<{ pricePrecision: number; quantityPrecision: number }> {
-    if (this.symbolInfoCache.has(symbol)) {
-      return this.symbolInfoCache.get(symbol)!;
-    }
-    logDebug(`[Binance] getSymbolInfo(${symbol})...`);
+  async prefetchExchangeInfo(): Promise<void> {
+    logInfo('[Binance] Prefetching exchange info...');
     try {
       const response = await this.client.get('/fapi/v1/exchangeInfo');
-      const symInfo = response.data.symbols.find((s: any) => s.symbol === symbol);
+      const symbols = (response.data.symbols || []) as Array<Record<string, unknown>>;
+      let cached = 0;
+      for (const s of symbols) {
+        if (s.status !== 'TRADING') continue;
+        const filters = this.extractSymbolFilters(s);
+        const info = {
+          pricePrecision: s.pricePrecision as number,
+          quantityPrecision: s.quantityPrecision as number,
+          filters,
+        };
+        this.symbolInfoCache.set(s.symbol as string, info);
+        cached++;
+      }
+      logInfo(`[Binance] Prefetched ${cached} symbols from exchange info`);
+    } catch (error: any) {
+      logWarn(`[Binance] prefetchExchangeInfo FAILED: ${error.message}. Will fetch per-symbol on demand.`);
+    }
+  }
+
+  private extractSymbolFilters(symInfo: Record<string, unknown>): SymbolFilters {
+    let minQty = '0.001';
+    let maxQty = '1000000';
+    let stepSize = '0.001';
+    let minNotional = '5';
+    for (const f of (symInfo.filters || []) as Array<Record<string, unknown>>) {
+      if (f.filterType === 'LOT_SIZE') {
+        minQty = (f.minQty as string) ?? minQty;
+        maxQty = (f.maxQty as string) ?? maxQty;
+        stepSize = (f.stepSize as string) ?? stepSize;
+      } else if (f.filterType === 'MIN_NOTIONAL') {
+        minNotional = ((f.notional ?? f.minNotional) as string) ?? '5';
+      } else if (f.filterType === 'MARKET_LOT_SIZE') {
+        minQty = (f.minQty as string) ?? minQty;
+        maxQty = (f.maxQty as string) ?? maxQty;
+        stepSize = (f.stepSize as string) ?? stepSize;
+      }
+    }
+    return { minQty, maxQty, stepSize, minNotional };
+  }
+
+  async getSymbolInfo(symbol: string): Promise<{ pricePrecision: number; quantityPrecision: number; filters: SymbolFilters }> {
+    if (this.symbolInfoCache.has(symbol)) {
+      const info = this.symbolInfoCache.get(symbol)!;
+      return { pricePrecision: info.pricePrecision, quantityPrecision: info.quantityPrecision, filters: info.filters };
+    }
+    logDebug(`[Binance] getSymbolInfo(${symbol}) cache miss, fetching exchangeInfo...`);
+    try {
+      const response = await this.client.get('/fapi/v1/exchangeInfo');
+      const symInfo = (response.data.symbols as Array<Record<string, unknown>>).find((s) => s.symbol === symbol);
       if (!symInfo) {
         logError(`[Binance] getSymbolInfo FAILED: Symbol ${symbol} not found in exchangeInfo`);
         throw new Error(`Symbol ${symbol} not found on Binance`);
       }
+      const filters = this.extractSymbolFilters(symInfo);
       const info = {
         pricePrecision: symInfo.pricePrecision as number,
         quantityPrecision: symInfo.quantityPrecision as number,
+        filters,
       };
       this.symbolInfoCache.set(symbol, info);
-      logInfo(`[Binance] getSymbolInfo OK: ${symbol} pricePrecision=${info.pricePrecision} qtyPrecision=${info.quantityPrecision}`);
+      logInfo(`[Binance] getSymbolInfo OK: ${symbol} pricePrecision=${info.pricePrecision} qtyPrecision=${info.quantityPrecision} minQty=${filters.minQty} minNotional=${filters.minNotional}`);
       return info;
     } catch (error: any) {
       logError(`[Binance] getSymbolInfo FAILED: ${symbol} - ${error.message}`);
@@ -311,6 +415,11 @@ export class BinanceService {
     const info = this.symbolInfoCache.get(symbol);
     const precision = info?.pricePrecision ?? 2;
     return price.toFixed(precision);
+  }
+
+  getSymbolFilters(symbol: string): SymbolFilters | null {
+    const info = this.symbolInfoCache.get(symbol);
+    return info?.filters ?? null;
   }
 
   destroy(): void {

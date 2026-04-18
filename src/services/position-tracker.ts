@@ -8,6 +8,8 @@ import {
 } from '../types';
 import { logInfo, logDebug, logWarn } from '../utils/logger';
 
+const SIZE_CHANGE_THRESHOLD = 1e-8;
+
 export class PositionTracker extends EventEmitter {
   private lastPositions: Map<string, MirrorPosition> = new Map();
   private lastRawState: HlClearinghouseState | null = null;
@@ -72,7 +74,7 @@ export class PositionTracker extends EventEmitter {
       } else if (prev && curr) {
         if (prev.side !== curr.side) {
           deltas.push({ type: 'SIDE_FLIPPED', symbol, previous: prev, current: curr, timestamp: now });
-        } else if (Math.abs(curr.size - prev.size) > 1e-8) {
+        } else if (Math.abs(curr.size - prev.size) > SIZE_CHANGE_THRESHOLD) {
           deltas.push({
             type: curr.size > prev.size ? 'INCREASED' : 'DECREASED',
             symbol, previous: prev, current: curr, timestamp: now,

@@ -1,4 +1,4 @@
-import { BinanceService } from './binance-service';
+import { BinanceService, SymbolFilters } from './binance-service';
 import { TradeSignal, ExecutionResult, StopOrderResult } from '../types';
 import { logInfo, logDebug, logWarn, logError } from '../utils/logger';
 
@@ -18,13 +18,10 @@ export class TradeExecutor {
     try {
       await this.ensureSymbolConfig(symbol, leverage, marginType);
 
-      const currentPrice = await this.binance.getMarkPrice(signal.symbol);
-      const priceDiff = Math.abs(parseFloat(currentPrice) - (signal.sourceDelta.current?.entryPrice ?? parseFloat(currentPrice)));
-      const priceDiffPct = priceDiff / parseFloat(currentPrice) * 100;
-
-      if (signal.priceTolerance && !signal.priceTolerance.shouldExecute) {
-        logWarn(`[Executor] Price tolerance check failed for ${symbol}: ${priceDiffPct.toFixed(2)}% > ${signal.priceTolerance.tolerance}%`);
-        return { success: false, symbol, side, quantity, error: 'price_tolerance_exceeded' };
+      const quantityCheck = this.checkMinQuantity(symbol, quantity, signal.priceTolerance?.currentPrice);
+      if (!quantityCheck.ok) {
+        logWarn(`[Executor] SKIP: quantity below minimum for ${symbol}: ${quantity} ${quantityCheck.reason}`);
+        return { success: false, symbol, side, quantity, error: quantityCheck.reason };
       }
 
       logInfo(`[Executor] Executing: ${side} ${quantity} ${symbol} @ market (${leverage}x ${marginType}) - ${reason}`);
@@ -51,6 +48,25 @@ export class TradeExecutor {
       logError(`[Executor] Failed to execute ${side} ${quantity} ${symbol}: ${error.message}`);
       return { success: false, symbol, side, quantity, error: error.message };
     }
+  }
+
+  private checkMinQuantity(symbol: string, quantity: number, markPrice?: number): { ok: boolean; reason: string } {
+    const filters = this.binance.getSymbolFilters(symbol);
+    if (!filters) {
+      return { ok: true, reason: 'no filters cached, allowing trade' };
+    }
+    const minQty = parseFloat(filters.minQty);
+    if (quantity < minQty) {
+      return { ok: false, reason: `quantity ${quantity} < minQty ${minQty}` };
+    }
+    if (markPrice) {
+      const notional = quantity * markPrice;
+      const minNotional = parseFloat(filters.minNotional);
+      if (notional < minNotional) {
+        return { ok: false, reason: `notional ${notional.toFixed(2)} USDT < minNotional ${minNotional} USDT` };
+      }
+    }
+    return { ok: true, reason: '' };
   }
 
   async closePosition(symbol: string, dryRun: boolean = false): Promise<ExecutionResult> {

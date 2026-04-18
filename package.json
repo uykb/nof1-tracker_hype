@@ -30,13 +30,17 @@
   "dependencies": {
     "axios": "^1.6.2",
     "commander": "^11.1.0",
+    "cors": "^2.8.6",
     "crypto-js": "^4.2.0",
     "dotenv": "^16.3.1",
+    "express": "^5.2.1",
     "fs-extra": "^11.3.2",
-    "ws": "^8.16.0"
+    "ws": "^8.20.0"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
     "@types/crypto-js": "^4.2.2",
+    "@types/express": "^5.0.6",
     "@types/fs-extra": "^11.0.4",
     "@types/jest": "^29.5.8",
     "@types/node": "^20.10.4",

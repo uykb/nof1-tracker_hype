@@ -3,6 +3,7 @@ import dotenv from 'dotenv';
 import { buildConfigFromEnv } from './config/constants';
 import { setLogLevel } from './utils/logger';
 import { MirrorEngine } from './services/mirror-engine';
+import { DashboardServer } from './services/dashboard-server';
 
 dotenv.config();
 
@@ -22,6 +23,8 @@ program
   .option('-p, --price-tolerance <percent>', 'Max price deviation % to still execute', parseFloat)
   .option('--dry-run', 'Simulate without executing trades', false)
   .option('-l, --log-level <level>', 'Log level: ERROR|WARN|INFO|DEBUG|VERBOSE', 'INFO')
+  .option('--dashboard', 'Enable web dashboard')
+  .option('--dashboard-port <port>', 'Dashboard port', parseInt)
   .action(async (options) => {
     setLogLevel(options.logLevel);
 
@@ -41,15 +44,24 @@ program
     }
 
     const engine = new MirrorEngine(envConfig);
+    let dashboard: DashboardServer | undefined;
 
     const gracefulShutdown = async () => {
       console.log('\nShutting down gracefully...');
+      if (dashboard) await dashboard.stop();
       await engine.stop();
       process.exit(0);
     };
 
     process.on('SIGINT', gracefulShutdown);
     process.on('SIGTERM', gracefulShutdown);
+
+    if (options.dashboard ?? !!process.env.DASHBOARD_PORT) {
+      const dashPort = options.dashboardPort ?? parseInt(process.env.DASHBOARD_PORT || '3001', 10);
+      dashboard = new DashboardServer(dashPort, envConfig);
+      dashboard.setEngine(engine);
+      await dashboard.start();
+    }
 
     try {
       await engine.start({

@@ -128,6 +128,10 @@ export interface ProcessedOrder {
   hlOid?: number;
   hlFillTime?: number;
   timestamp: number;
+  pnl?: number;
+  commission?: number;
+  entryPrice?: number;
+  exitPrice?: number;
 }
 
 export interface MirroredTradeRecord {

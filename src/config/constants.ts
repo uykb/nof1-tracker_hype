@@ -32,23 +32,58 @@ export const DATA_CONFIG = {
 export function buildConfigFromEnv(): AppConfig {
   const hlTestnet = process.env.HYPERLIQUID_TESTNET === 'true';
   const binanceTestnet = process.env.BINANCE_TESTNET === 'true';
+
+  const targetAddress = process.env.HYPERLIQUID_TARGET_ADDRESS || '';
+  const apiKey = process.env.BINANCE_API_KEY || '';
+  const apiSecret = process.env.BINANCE_API_SECRET || '';
+  const fixedRatio = parseFloat(process.env.FIXED_RATIO || '1.0');
+  const priceTolerancePercent = parseFloat(process.env.PRICE_TOLERANCE_PERCENT || '1.0');
+  const pollIntervalMs = parseInt(process.env.HYPERLIQUID_POLL_INTERVAL_MS || '3000', 10);
+
+  if (!targetAddress) {
+    throw new Error('HYPERLIQUID_TARGET_ADDRESS is required');
+  }
+  if (!/^0x[0-9a-fA-F]{40}$/.test(targetAddress)) {
+    throw new Error(`HYPERLIQUID_TARGET_ADDRESS invalid format: "${targetAddress}". Must be 0x-prefixed 40-char hex.`);
+  }
+  if (!apiKey) {
+    throw new Error('BINANCE_API_KEY is required');
+  }
+  if (!apiSecret) {
+    throw new Error('BINANCE_API_SECRET is required');
+  }
+  if (isNaN(fixedRatio) || fixedRatio <= 0 || fixedRatio > 1) {
+    throw new Error(`FIXED_RATIO must be > 0 and <= 1, got: "${process.env.FIXED_RATIO}"`);
+  }
+  if (isNaN(priceTolerancePercent) || priceTolerancePercent <= 0) {
+    throw new Error(`PRICE_TOLERANCE_PERCENT must be > 0, got: "${process.env.PRICE_TOLERANCE_PERCENT}"`);
+  }
+  if (isNaN(pollIntervalMs) || pollIntervalMs < 1000) {
+    throw new Error(`HYPERLIQUID_POLL_INTERVAL_MS must be >= 1000, got: "${process.env.HYPERLIQUID_POLL_INTERVAL_MS}"`);
+  }
+
+  const marginTypeRaw = process.env.MARGIN_TYPE || TRADING_CONFIG.DEFAULT_MARGIN_TYPE;
+  if (marginTypeRaw !== 'ISOLATED' && marginTypeRaw !== 'CROSSED') {
+    throw new Error(`MARGIN_TYPE must be ISOLATED or CROSSED, got: "${marginTypeRaw}"`);
+  }
+
   return {
     hyperliquid: {
       apiUrl: hlTestnet ? HYPERLIQUID_CONFIG.TESTNET_API_URL : HYPERLIQUID_CONFIG.MAINNET_API_URL,
       wsUrl: hlTestnet ? HYPERLIQUID_CONFIG.TESTNET_WS_URL : HYPERLIQUID_CONFIG.MAINNET_WS_URL,
-      targetAddress: process.env.HYPERLIQUID_TARGET_ADDRESS || '',
-      pollIntervalMs: parseInt(process.env.HYPERLIQUID_POLL_INTERVAL_MS || '3000', 10),
+      targetAddress,
+      pollIntervalMs,
     },
     binance: {
-      apiKey: process.env.BINANCE_API_KEY || '',
-      apiSecret: process.env.BINANCE_API_SECRET || '',
+      apiKey,
+      apiSecret,
       baseUrl: binanceTestnet ? BINANCE_CONFIG.TESTNET_BASE_URL : BINANCE_CONFIG.MAINNET_BASE_URL,
       testnet: binanceTestnet,
     },
     trading: {
-      fixedRatio: parseFloat(process.env.FIXED_RATIO || '1.0'),
-      priceTolerancePercent: parseFloat(process.env.PRICE_TOLERANCE_PERCENT || '1.0'),
-      marginType: (process.env.MARGIN_TYPE as 'ISOLATED' | 'CROSSED') || TRADING_CONFIG.DEFAULT_MARGIN_TYPE,
+      fixedRatio,
+      priceTolerancePercent,
+      marginType: marginTypeRaw as 'ISOLATED' | 'CROSSED',
     },
     logging: {
       level: process.env.LOG_LEVEL || 'INFO',

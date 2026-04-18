@@ -6,6 +6,7 @@ import { BinanceService } from './binance-service';
 import { TradeExecutor } from './trade-executor';
 import { RiskManager } from './risk-manager';
 import { OrderHistoryManager } from './order-history';
+import { NotificationManager, createNotifiersFromEnv, NotificationMessage } from './notifier';
 import { AppConfig, FollowOptions, HlFill, PositionDelta, TradeSignal } from '../types';
 import { logInfo, logDebug, logWarn, logError } from '../utils/logger';
 
@@ -17,8 +18,14 @@ export class MirrorEngine extends EventEmitter {
   private executor: TradeExecutor;
   private riskManager: RiskManager;
   private orderHistory: OrderHistoryManager;
-  private pollTimer: NodeJS.Timer | null = null;
+  private notifier: NotificationManager;
+  private pollTimer: NodeJS.Timeout | null = null;
   private isRunning = false;
+  private isProcessing = false;
+  private consecutiveEmptyPolls = 0;
+  private static readonly MIN_POLL_INTERVAL = 3000;
+  private static readonly MAX_POLL_INTERVAL = 30000;
+  private static readonly IDLE_THRESHOLD = 3;
 
   constructor(private config: AppConfig) {
     super();
@@ -29,6 +36,10 @@ export class MirrorEngine extends EventEmitter {
     this.executor = new TradeExecutor(this.binance);
     this.riskManager = new RiskManager(config.trading.priceTolerancePercent);
     this.orderHistory = new OrderHistoryManager();
+    this.notifier = new NotificationManager();
+    for (const n of createNotifiersFromEnv()) {
+      this.notifier.addNotifier(n);
+    }
   }
 
   async start(options?: FollowOptions): Promise<void> {
@@ -53,49 +64,57 @@ export class MirrorEngine extends EventEmitter {
     this.isRunning = true;
 
     try {
-      logInfo('[Mirror] Step 1/5: Syncing Binance server time...');
+      logInfo('[Mirror] Step 1/6: Syncing Binance server time...');
       await this.binance.syncServerTime();
-      logInfo('[Mirror] Step 1/5: Binance server time synced OK');
+      logInfo('[Mirror] Step 1/6: Binance server time synced OK');
     } catch (error: any) {
       logError(`[Mirror] Step 1/5 FAILED: Binance server time sync error: ${error.message}`);
       throw error;
     }
 
     try {
-      logInfo('[Mirror] Step 2/5: Verifying Binance account...');
+      logInfo('[Mirror] Step 2/6: Verifying Binance account...');
       const account = await this.binance.getAccountInfo();
-      logInfo(`[Mirror] Step 2/5: Binance account OK, available balance: ${account.availableBalance} USDT`);
+      logInfo(`[Mirror] Step 2/6: Binance account OK, available balance: ${account.availableBalance} USDT`);
     } catch (error: any) {
-      logError(`[Mirror] Step 2/5 FAILED: Binance account verification error: ${error.message}`);
+      logError(`[Mirror] Step 2/6 FAILED: Binance account verification error: ${error.message}`);
       throw error;
     }
 
     try {
-      logInfo('[Mirror] Step 3/5: Loading order history...');
+      logInfo('[Mirror] Step 3/6: Prefetching Binance exchange info...');
+      await this.binance.prefetchExchangeInfo();
+      logInfo('[Mirror] Step 3/6: Exchange info prefetched OK');
+    } catch (error: any) {
+      logWarn(`[Mirror] Step 3/6 WARNING: Prefetch exchange info failed: ${error.message}. Will fetch per-symbol on demand.`);
+    }
+
+    try {
+      logInfo('[Mirror] Step 4/6: Loading order history...');
       await this.orderHistory.load();
-      logInfo('[Mirror] Step 3/5: Order history loaded OK');
+      logInfo('[Mirror] Step 4/6: Order history loaded OK');
     } catch (error: any) {
-      logError(`[Mirror] Step 3/5 FAILED: Order history load error: ${error.message}`);
+      logError(`[Mirror] Step 4/6 FAILED: Order history load error: ${error.message}`);
       throw error;
     }
 
     try {
-      logInfo('[Mirror] Step 4/5: Initializing position tracker...');
+      logInfo('[Mirror] Step 5/6: Initializing position tracker...');
       await this.tracker.initialize(this.config.hyperliquid.targetAddress);
-      logInfo('[Mirror] Step 4/5: Position tracker initialized OK');
+      logInfo('[Mirror] Step 5/6: Position tracker initialized OK');
     } catch (error: any) {
-      logError(`[Mirror] Step 4/5 FAILED: Position tracker init error: ${error.message}`);
+      logError(`[Mirror] Step 5/6 FAILED: Position tracker init error: ${error.message}`);
       throw error;
     }
 
     this.setupWsListeners();
     try {
-      logInfo('[Mirror] Step 5/5: Connecting WebSocket...');
+      logInfo('[Mirror] Step 6/6: Connecting WebSocket...');
       await this.hlWs.connect();
       this.hlWs.subscribeToFills();
-      logInfo('[Mirror] Step 5/5: WebSocket connected and subscribed OK');
+      logInfo('[Mirror] Step 6/6: WebSocket connected and subscribed OK');
     } catch (error: any) {
-      logWarn(`[Mirror] Step 5/5 WARNING: WebSocket connection failed, falling back to polling only: ${error.message}`);
+      logWarn(`[Mirror] Step 6/6 WARNING: WebSocket connection failed, falling back to polling only: ${error.message}`);
     }
 
     this.startPolling();
@@ -119,6 +138,7 @@ export class MirrorEngine extends EventEmitter {
     this.hlWs.on('fill', (fill: HlFill) => {
       logInfo(`[Mirror] WS fill: ${fill.coin} ${fill.side} ${fill.sz} @ ${fill.px}`);
       this.tracker.notifyFill(fill);
+      this.resetPollInterval();
       this.pollAndProcess().catch((err) => {
         logError(`[Mirror] WS-triggered poll error: ${(err as Error).message}`);
       });
@@ -130,67 +150,99 @@ export class MirrorEngine extends EventEmitter {
 
     this.hlWs.on('disconnected', (reason: string) => {
       logWarn(`[Mirror] WebSocket disconnected: ${reason}`);
+      this.notifier.notify('WARNING', 'WebSocket Disconnected', `HL WebSocket disconnected: ${reason}`);
     });
 
     this.hlWs.on('error', (error: Error) => {
       logError(`[Mirror] WebSocket error: ${error.message}`);
+      this.notifier.notify('ERROR', 'WebSocket Error', error.message);
     });
   }
 
   private startPolling(): void {
     this.stopPolling();
-    const interval = this.config.hyperliquid.pollIntervalMs;
-    this.pollTimer = setInterval(async () => {
+    this.consecutiveEmptyPolls = 0;
+    this.scheduleNextPoll(MirrorEngine.MIN_POLL_INTERVAL);
+  }
+
+  private scheduleNextPoll(delay: number): void {
+    this.pollTimer = setTimeout(async () => {
       try {
         await this.pollAndProcess();
       } catch (error) {
         logError(`[Mirror] Poll error: ${(error as Error).message}`);
       }
-    }, interval) as unknown as NodeJS.Timer;
+      if (this.isRunning) {
+        const nextDelay = this.getNextPollDelay();
+        this.scheduleNextPoll(nextDelay);
+      }
+    }, delay);
+  }
+
+  private getNextPollDelay(): number {
+    if (this.consecutiveEmptyPolls >= MirrorEngine.IDLE_THRESHOLD) {
+      return MirrorEngine.MAX_POLL_INTERVAL;
+    }
+    return MirrorEngine.MIN_POLL_INTERVAL;
+  }
+
+  private resetPollInterval(): void {
+    this.consecutiveEmptyPolls = 0;
   }
 
   private stopPolling(): void {
     if (this.pollTimer) {
-      clearInterval(this.pollTimer as unknown as number);
+      clearTimeout(this.pollTimer);
       this.pollTimer = null;
     }
   }
 
   private async pollAndProcess(): Promise<void> {
     if (!this.tracker.isReady()) return;
-
-    let deltas: PositionDelta[];
-    try {
-      deltas = await this.tracker.detectChanges(this.config.hyperliquid.targetAddress);
-    } catch (error: any) {
-      logError(`[Mirror] detectChanges FAILED: ${error.message}`);
+    if (this.isProcessing) {
+      logDebug('[Mirror] pollAndProcess skipped: already processing');
       return;
     }
-
-    if (deltas.length === 0) {
-      logDebug('[Mirror] No position changes detected');
-      return;
-    }
-
+    this.isProcessing = true;
     try {
-      const count = await this.executor.cleanOrphanedOrders();
-      if (count > 0) logInfo(`[Mirror] Cleaned ${count} orphaned order(s)`);
-    } catch (error: any) {
-      logWarn(`[Mirror] cleanOrphanedOrders FAILED (non-fatal): ${error.message}`);
-    }
-
-    for (const delta of deltas) {
+      let deltas: PositionDelta[];
       try {
-        await this.processDelta(delta);
+        deltas = await this.tracker.detectChanges(this.config.hyperliquid.targetAddress);
       } catch (error: any) {
-        logError(`[Mirror] processDelta FAILED for ${delta.type} ${delta.symbol}: ${error.message}`);
+        logError(`[Mirror] detectChanges FAILED: ${error.message}`);
+        return;
       }
-    }
 
-    try {
-      await this.orderHistory.save();
-    } catch (error: any) {
-      logError(`[Mirror] orderHistory.save FAILED: ${error.message}`);
+      if (deltas.length === 0) {
+        this.consecutiveEmptyPolls++;
+        logDebug('[Mirror] No position changes detected');
+        return;
+      }
+
+      this.resetPollInterval();
+
+      try {
+        const count = await this.executor.cleanOrphanedOrders();
+        if (count > 0) logInfo(`[Mirror] Cleaned ${count} orphaned order(s)`);
+      } catch (error: any) {
+        logWarn(`[Mirror] cleanOrphanedOrders FAILED (non-fatal): ${error.message}`);
+      }
+
+      for (const delta of deltas) {
+        try {
+          await this.processDelta(delta);
+        } catch (error: any) {
+          logError(`[Mirror] processDelta FAILED for ${delta.type} ${delta.symbol}: ${error.message}`);
+        }
+      }
+
+      try {
+        await this.orderHistory.save();
+      } catch (error: any) {
+        logError(`[Mirror] orderHistory.save FAILED: ${error.message}`);
+      }
+    } finally {
+      this.isProcessing = false;
     }
   }
 
@@ -199,6 +251,12 @@ export class MirrorEngine extends EventEmitter {
     const signal = this.riskManager.buildSignalFromDelta(delta, opts.ratio);
     if (!signal) {
       logDebug(`[Mirror] No signal for delta type ${delta.type} on ${delta.symbol}`);
+      return;
+    }
+
+    const dedupKey = `${delta.symbol}:${signal.side}:${delta.timestamp}`;
+    if (this.orderHistory.isOrderProcessed(delta.symbol, signal.side, delta.timestamp)) {
+      logInfo(`[Mirror] SKIP duplicate: ${delta.type} ${delta.symbol} (already processed, key=${dedupKey})`);
       return;
     }
 
@@ -213,6 +271,8 @@ export class MirrorEngine extends EventEmitter {
         await this.handleSideFlip(signal, delta, opts.dryRun);
       } else if (delta.type === 'LEVERAGE_CHANGED') {
         await this.handleLeverageChange(signal);
+      } else {
+        logWarn(`[Mirror] Unknown MODIFY subtype: ${delta.type} for ${delta.symbol}`);
       }
     }
   }
@@ -268,28 +328,10 @@ export class MirrorEngine extends EventEmitter {
         timestamp: Date.now(),
       });
       logInfo(`[Mirror] Enter OK: orderId=${result.orderId ?? 'N/A'} qty=${signal.quantity.toFixed(4)} ${signal.symbol} price=${result.price ?? 'market'}`);
-
-      // Step 4: Place stop orders (optional)
-      if (delta.current.liquidationPrice && !dryRun) {
-        const side = delta.current.side === 'LONG' ? 'BUY' : 'SELL';
-        logInfo(`[Mirror]   Step 4: placing stop orders (SL=${delta.current.liquidationPrice})...`);
-        try {
-          await this.executor.placeStopOrders(
-            signal.symbol,
-            side,
-            signal.quantity,
-            undefined,
-            delta.current.liquidationPrice,
-          );
-          logInfo(`[Mirror]   Step 4: stop orders placed`);
-        } catch (error: any) {
-          logWarn(`[Mirror]   Step 4 FAILED: stop orders error: ${error.message}`);
-        }
-      } else {
-        logDebug(`[Mirror]   Step 4: skip stop orders (no liquidation price or dry-run)`);
-      }
+      this.notifier.notify('TRADE', `Enter ${signal.side} ${signal.symbol}`, `qty=${signal.quantity.toFixed(4)} @ ${result.price ?? 'market'} orderId=${result.orderId ?? 'N/A'}`);
     } else {
       logError(`[Mirror] Enter FAILED: ${result.error}`);
+      this.notifier.notify('ERROR', `Enter FAILED ${signal.symbol}`, result.error ?? 'unknown error');
     }
   }
 
@@ -312,6 +354,7 @@ export class MirrorEngine extends EventEmitter {
       logInfo(`[Mirror] Exit OK: orderId=${result.orderId ?? 'N/A'}`);
     } else {
       logError(`[Mirror] Exit FAILED: ${result.error}`);
+      this.notifier.notify('ERROR', `Exit FAILED ${signal.symbol}`, result.error ?? 'unknown error');
     }
   }
 
@@ -393,5 +436,21 @@ export class MirrorEngine extends EventEmitter {
       priceTolerance: this.config.trading.priceTolerancePercent,
       dryRun: false,
     };
+  }
+
+  getTracker(): PositionTracker {
+    return this.tracker;
+  }
+
+  getBinance(): BinanceService {
+    return this.binance;
+  }
+
+  getOrderHistory(): OrderHistoryManager {
+    return this.orderHistory;
+  }
+
+  getIsRunning(): boolean {
+    return this.isRunning;
   }
 }

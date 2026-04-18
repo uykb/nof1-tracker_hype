@@ -52,7 +52,9 @@ export class OrderHistoryManager {
   async save(): Promise<void> {
     this.data.lastUpdated = Date.now();
     await fs.ensureDir(path.dirname(this.filePath));
-    await fs.writeJson(this.filePath, this.data, { spaces: 2 });
+    const tmpPath = this.filePath + '.tmp';
+    await fs.writeJson(tmpPath, this.data, { spaces: 2 });
+    await fs.rename(tmpPath, this.filePath);
   }
 
   isOrderProcessed(symbol: string, side: string, hlFillTime: number): boolean {
@@ -93,6 +95,23 @@ export class OrderHistoryManager {
         ? Math.min(...this.data.processedOrders.map((o) => o.timestamp))
         : null,
     };
+  }
+
+  getCumulativeStats(): { totalPnl: number; totalCommission: number; winCount: number; lossCount: number; totalOrders: number } {
+    const orders = this.data.processedOrders;
+    let totalPnl = 0;
+    let totalCommission = 0;
+    let winCount = 0;
+    let lossCount = 0;
+    for (const o of orders) {
+      if (o.pnl !== undefined) {
+        totalPnl += o.pnl;
+        if (o.pnl > 0) winCount++;
+        else if (o.pnl < 0) lossCount++;
+      }
+      if (o.commission !== undefined) totalCommission += o.commission;
+    }
+    return { totalPnl, totalCommission, winCount, lossCount, totalOrders: orders.length };
   }
 
   printStats(): void {
