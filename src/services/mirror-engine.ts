@@ -127,6 +127,7 @@ export class MirrorEngine extends EventEmitter {
     this.startPolling();
     logInfo('[Mirror] All steps completed. Polling started.');
     this.emit('started');
+    this.notifier.notify('STATUS', '引擎已启动', `目标: ${this.config.hyperliquid.targetAddress.slice(0, 8)}... | 比例: ${this.config.trading.fixedRatio} | ${this.config.binance.testnet ? '测试网' : '主网'}`);
   }
 
   async stop(): Promise<void> {
@@ -166,7 +167,7 @@ export class MirrorEngine extends EventEmitter {
         logInfo(`[Mirror] WebSocket disconnected (normal): ${reason}`);
       } else {
         logWarn(`[Mirror] WebSocket disconnected: ${reason}`);
-        this.notifier.notify('WARNING', 'WebSocket Disconnected', `HL WebSocket disconnected: ${reason}`);
+        this.notifier.notify('WARNING', 'WS 断线重连中', `原因: ${reason}`);
       }
     });
 
@@ -176,7 +177,7 @@ export class MirrorEngine extends EventEmitter {
       } else {
         logError(`[Mirror] WebSocket error: ${error.message}`);
       }
-      this.notifier.notify('ERROR', 'WebSocket Error', error.message);
+      this.notifier.notify('ERROR', 'WS 连接异常', error.message);
     });
   }
 
@@ -359,10 +360,11 @@ export class MirrorEngine extends EventEmitter {
         timestamp: Date.now(),
       });
       logInfo(`[Mirror] Enter OK: orderId=${result.orderId ?? 'N/A'} qty=${signal.quantity.toFixed(4)} ${signal.symbol} price=${result.price ?? 'market'}`);
-      this.notifier.notify('TRADE', `Enter ${signal.side} ${signal.symbol}`, `qty=${signal.quantity.toFixed(4)} @ ${result.price ?? 'market'} orderId=${result.orderId ?? 'N/A'}`);
+      const sideLabel = signal.side === 'BUY' ? '做多' : '做空';
+      this.notifier.notify('TRADE', `开仓${sideLabel} ${signal.symbol}`, `${signal.quantity.toFixed(4)} @ ${result.price ?? '市价'} | 订单 #${result.orderId ?? 'N/A'}`);
     } else {
       logError(`[Mirror] Enter FAILED: ${result.error}`);
-      this.notifier.notify('ERROR', `Enter FAILED ${signal.symbol}`, result.error ?? 'unknown error');
+      this.notifier.notify('ERROR', `开仓失败 ${signal.symbol}`, `原因: ${result.error ?? '未知错误'}`);
     }
   }
 
@@ -383,9 +385,10 @@ export class MirrorEngine extends EventEmitter {
         hlFillTime: delta.timestamp,
       });
       logInfo(`[Mirror] Exit OK: orderId=${result.orderId ?? 'N/A'}`);
+      this.notifier.notify('TRADE', `平仓 ${signal.symbol}`, `订单 #${result.orderId ?? 'N/A'}`);
     } else {
       logError(`[Mirror] Exit FAILED: ${result.error}`);
-      this.notifier.notify('ERROR', `Exit FAILED ${signal.symbol}`, result.error ?? 'unknown error');
+      this.notifier.notify('ERROR', `平仓失败 ${signal.symbol}`, `原因: ${result.error ?? '未知错误'}`);
     }
   }
 
@@ -435,8 +438,11 @@ export class MirrorEngine extends EventEmitter {
     const result = await this.executor.executeSignal(signal, dryRun);
     if (result.success) {
       logInfo(`[Mirror] Side flip OK: orderId=${result.orderId ?? 'N/A'}`);
+      const sideLabel = signal.side === 'BUY' ? '做多' : '做空';
+      this.notifier.notify('TRADE', `翻仓${sideLabel} ${signal.symbol}`, `${signal.quantity.toFixed(4)} @ ${result.price ?? '市价'} | 订单 #${result.orderId ?? 'N/A'}`);
     } else {
       logError(`[Mirror] Side flip entry FAILED: ${result.error}`);
+      this.notifier.notify('ERROR', `翻仓失败 ${signal.symbol}`, `原因: ${result.error ?? '未知错误'}`);
     }
   }
 
@@ -447,6 +453,7 @@ export class MirrorEngine extends EventEmitter {
       logDebug(`[Mirror]   Step 1: setLeverage(${signal.symbol}, ${signal.leverage})...`);
       await this.binance.setLeverage(signal.symbol, signal.leverage);
       logInfo(`[Mirror]   Step 1: setLeverage OK`);
+      this.notifier.notify('STATUS', `杠杆变更 ${signal.symbol}`, `已调整为 ${signal.leverage}x ${signal.marginType}`);
     } catch (error: any) {
       logWarn(`[Mirror]   Step 1 FAILED: setLeverage: ${error.message}`);
     }

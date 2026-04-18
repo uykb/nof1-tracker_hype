@@ -16,13 +16,17 @@ export class DiscordNotifier implements Notifier {
 
   async send(message: NotificationMessage): Promise<void> {
     try {
+      const emoji = message.type === 'TRADE' ? '🟢'
+        : message.type === 'ERROR' ? '🔴'
+        : message.type === 'WARNING' ? '🟡'
+        : '🔵';
       const color = message.type === 'ERROR' ? 0xff0000
         : message.type === 'TRADE' ? 0x00ff00
         : message.type === 'WARNING' ? 0xffaa00
         : 0x00aaff;
       const payload = {
         embeds: [{
-          title: message.title,
+          title: `${emoji} ${message.title}`,
           description: message.body,
           color,
           timestamp: new Date(message.timestamp).toISOString(),
