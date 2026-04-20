@@ -30,9 +30,12 @@ export class MirrorEngine extends EventEmitter {
   private isRunning = false;
   private isProcessing = false;
   private consecutiveEmptyPolls = 0;
+  private wsDownSince: number | null = null;
+  private wsDownAlertTimer: NodeJS.Timeout | null = null;
   private static readonly MIN_POLL_INTERVAL = 3000;
   private static readonly MAX_POLL_INTERVAL = 30000;
   private static readonly IDLE_THRESHOLD = 3;
+  private static readonly WS_DOWN_ALERT_DELAY = 120000;
 
   constructor(private config: AppConfig) {
     super();
@@ -135,6 +138,7 @@ export class MirrorEngine extends EventEmitter {
     this.isRunning = false;
 
     this.stopPolling();
+    this.clearWsDownAlert();
     this.hlWs.disconnect();
 
     await this.orderHistory.save();
@@ -159,6 +163,15 @@ export class MirrorEngine extends EventEmitter {
 
     this.hlWs.on('connected', () => {
       logInfo('[Mirror] WebSocket reconnected');
+      if (this.wsDownSince !== null) {
+        const downtime = Date.now() - this.wsDownSince;
+        this.clearWsDownAlert();
+        this.wsDownSince = null;
+        if (downtime >= MirrorEngine.WS_DOWN_ALERT_DELAY) {
+          const secs = Math.round(downtime / 1000);
+          this.notifier.notify('STATUS', 'WS 已恢复连接', `宕机时长: ${secs}s`);
+        }
+      }
     });
 
     this.hlWs.on('disconnected', (reason: string) => {
@@ -167,8 +180,9 @@ export class MirrorEngine extends EventEmitter {
         logInfo(`[Mirror] WebSocket disconnected (normal): ${reason}`);
       } else {
         logWarn(`[Mirror] WebSocket disconnected: ${reason}`);
-        this.notifier.notify('WARNING', 'WS 断线重连中', `原因: ${reason}`);
       }
+      this.wsDownSince = Date.now();
+      this.scheduleWsDownAlert(reason);
     });
 
     this.hlWs.on('error', (error: Error) => {
@@ -177,7 +191,6 @@ export class MirrorEngine extends EventEmitter {
       } else {
         logError(`[Mirror] WebSocket error: ${error.message}`);
       }
-      this.notifier.notify('ERROR', 'WS 连接异常', error.message);
     });
   }
 
@@ -490,5 +503,22 @@ export class MirrorEngine extends EventEmitter {
 
   getIsRunning(): boolean {
     return this.isRunning;
+  }
+
+  private scheduleWsDownAlert(reason: string): void {
+    this.clearWsDownAlert();
+    this.wsDownAlertTimer = setTimeout(() => {
+      if (this.wsDownSince !== null) {
+        const secs = Math.round((Date.now() - this.wsDownSince) / 1000);
+        this.notifier.notify('WARNING', 'WS 断线超过2分钟', `原因: ${reason} | 已断线 ${secs}s`);
+      }
+    }, MirrorEngine.WS_DOWN_ALERT_DELAY);
+  }
+
+  private clearWsDownAlert(): void {
+    if (this.wsDownAlertTimer) {
+      clearTimeout(this.wsDownAlertTimer);
+      this.wsDownAlertTimer = null;
+    }
   }
 }
