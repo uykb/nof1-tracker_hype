@@ -180,9 +180,9 @@ export class MirrorEngine extends EventEmitter {
         logInfo(`[Mirror] WebSocket disconnected (normal): ${reason}`);
       } else {
         logWarn(`[Mirror] WebSocket disconnected: ${reason}`);
+        this.wsDownSince = Date.now();
+        this.scheduleWsDownAlert(reason);
       }
-      this.wsDownSince = Date.now();
-      this.scheduleWsDownAlert(reason);
     });
 
     this.hlWs.on('error', (error: Error) => {
